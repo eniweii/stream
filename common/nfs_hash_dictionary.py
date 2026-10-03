@@ -1,10 +1,10 @@
 """
 Loads a plain wordlist (one candidate string per line, '#' comments
-allowed) from the same directory as this file - NOT embedded in the code -
+allowed) from outputs/hashes_main.txt (local only, not in git) - NOT embedded in the code -
 and hashes every line with bin_hash() to build a reverse hash->name lookup.
 
 Point this at CiPH3R-88/NFS_Raider_v2.0's hashes_main.txt (or any similarly-
-shaped wordlist) by dropping it next to these scripts as hashes_main.txt.
+shaped wordlist) by dropping it into the repo's outputs/ folder as hashes_main.txt.
 Kept external and optional: nothing in this project requires this file to
 be present, it just resolves more names when it is.
 """
@@ -15,8 +15,9 @@ _sys.path[:0] = [str(_pl.Path(__file__).resolve().parents[1] / _d) for _d in ['c
 import os
 
 from nfs_hashing import bin_hash
+from nfs_outputs import OUTPUTS
 
-_DEFAULT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hashes_main.txt")
+_DEFAULT_PATH = os.path.join(str(OUTPUTS), "hashes_main.txt")
 
 _cache = {}  # path -> {hash: name}
 

@@ -1,0 +1,56 @@
+# Hand-maintained chunk registry. One row per chunk ID.
+# file: stream | region | unlabeled (label before any reader is written).
+# status: done | partial | scan-only | unread | set-aside | out-of-scope
+# Edit this file when a tool starts or stops reading a chunk.
+chunk_id	name	file	status	tool	roadmap	note
+0x80034100	ScenerySection (container)	stream	done	scenery/nfs_stream_scenery.py	T1.1-3	one per section; children below
+0x00034101	Scenery header	stream	partial	scenery/nfs_stream_scenery.py	T1.1	only section number (+0x0C) read
+0x00034102	SceneryInfo array (0x48 each)	stream	partial	scenery/nfs_stream_scenery.py	T1.1	name, first solid key, flags read; keys 2-4 unread
+0x00034103	SceneryInstance array (0x60 each)	stream	partial	scenery/nfs_stream_scenery.py	T1.2	flags, position, rotation, guid, info index read
+0x00034105	Scenery tree nodes	stream	unread		T2	completeness tier
+0x00034107	Scenery preculler	stream	unread		T2	keep raw bytes
+0x00034108	Scenery override infos (6 bytes each)	stream	done	scenery/nfs_stream_scenery.py	T1.3	-
+0x00034109	Scenery groups	stream	done	scenery/nfs_stream_scenery.py	T1.3	-
+0x0003410D	Light texture collections	stream	unread		T2	-
+0x80134000	ObjectPack (container)	stream	partial	solids_materials/nfs_solid_reader.py	T1.4	-
+0x80134010	Solid object (container)	stream	done	solids_materials/nfs_solid_reader.py	T1.4	-
+0x00134011	Solid header	stream	partial	solids_materials/nfs_solid_reader.py	T1.4	version, hash, bounds, name read
+0x00134012	Solid texture list	stream	partial	solids_materials/nfs_solid_reader.py	T1.4	first u32 of each 8-byte entry read
+0x0013401A	SolidMarkers (position_marker, 0x50 each)	stream	partial	flares/flare_scenery_scan.py	T1.5	44 chunks at size 92 unexplained
+0x0013401D	Solid morph targets	stream	done	solids_materials/nfs_solid_reader.py	T1.4	-
+0x80134100	Solid Plat (container)	stream	done	solids_materials/nfs_solid_reader.py	T1.4	-
+0x00134B01	Plat vertex buffer	stream	done	solids_materials/nfs_solid_reader.py	T1.4	-
+0x00134B02	Plat mesh entries (shading groups, 144 bytes)	stream	partial	solids_materials/nfs_solid_reader.py	T1.4	see tool_gaps.md
+0x00134B03	Plat indices	stream	done	solids_materials/nfs_solid_reader.py	T1.4	-
+0x00134C02	Plat mesh entry name	stream	done	solids_materials/nfs_solid_reader.py	T1.4	-
+0x00135002	Light AABB	stream	unread		T2	-
+0x00135200	Flare pack (flare::pack + flare::instance)	stream	scan-only	flares/flare_scan.py	T1.5	ID found by discovery mode
+0x33310004	TextureStruct array (0x58 each)	stream	partial	texture_anim/uv_scroll_dump.py	T1.7	UV scroll fields only
+0x33312001	TextureAnimPack header	stream	scan-only	texture_anim/texture_anim_scan.py	T1.7	layout confirmed on two samples
+0x33312002	TextureAnimPack frames (12 bytes each)	stream	scan-only	texture_anim/texture_anim_scan.py	T1.7	first u32 of each entry read
+0xB3312000	TextureAnimPack pack (container)	stream	scan-only	texture_anim/texture_anim_scan.py	T1.7	hex dump only
+0xB3312004	TextureAnimPack inst (container)	stream	scan-only	texture_anim/texture_anim_scan.py	T1.7	hex dump only
+0x00037220	world_anim header	stream	done	world_anim/world_anim_scan.py	closed	-
+0x00037240	world_anim frames	stream	done	world_anim/parse_2600_anims.py	closed	-
+0x00037250	world_anim rtnode	stream	partial	world_anim/dump_worldanim_2400.py	closed	playback items open
+0x00037260	world_anim counts	stream	done	world_anim/world_anim_scan.py	closed	-
+0x00037270	world_anim endptr	stream	done	world_anim/world_anim_scan.py	closed	-
+0x0003BC00	EmitterLibrary / WorldFXTrigger (0x50 each)	stream	partial	emitters/dump_fx_trigger_matrices.py	T2	0x30 block undecoded
+0x80036000	EventTriggerPack (container)	stream	set-aside	triggers/world_event_trigger_scan.py	T2	ambient audio triggers
+0x00036001	EventTrigger header	stream	set-aside	triggers/world_event_trigger_scan.py	T2	-
+0x00036002	EventTrigger AABB tree	stream	set-aside	triggers/world_event_trigger_scan.py	T2	leaves sampled only
+0x00036003	EventTrigger records	stream	set-aside	triggers/world_event_trigger_scan.py	T2	-
+0x0003B801	unknown (not CARP 0x3B800)	unlabeled	unread		T2	hex-check first
+0x0003B802	unknown (not CARP 0x3B800)	unlabeled	unread		T2	hex-check first
+0x00034027	unknown	unlabeled	unread		T2	-
+0x00034191	unknown	unlabeled	unread		T2	-
+0x00034110	unknown (0x34110-0x34113)	unlabeled	unread		T2	-
+0x00034111	unknown (0x34110-0x34113)	unlabeled	unread		T2	-
+0x00034112	unknown (0x34110-0x34113)	unlabeled	unread		T2	-
+0x00034113	unknown (0x34110-0x34113)	unlabeled	unread		T2	-
+0x80034147	TrackPathManager (container)	region	out-of-scope	region/nfs_trackpath.py	region	-
+0x0003414A	TrackPath zones	region	out-of-scope	region/nfs_trackpath.py	region	-
+0x0003414D	TrackPath barriers	region	out-of-scope	region/nfs_trackpath.py	region	-
+0x80034150	VisibleSections (container)	region	out-of-scope	region/nfs_region_parser.py	region	-
+0x00034153	VisibleSections boundaries	region	out-of-scope	region/nfs_region_parser.py	region	-
+0x0003B800	CARP world grid	region	out-of-scope	region/nfs_carp_parser.py	region	own offset-table format

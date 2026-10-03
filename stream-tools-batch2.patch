@@ -1,0 +1,688 @@
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..a57cf34
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,49 @@
++# stream
++
++Python tools for reading NFS Carbon (Black Box) data files, mainly the stream file
++`STREAML5RA.BUN`. One folder for each topic. Folders match `CARBON_STREAM_ROADMAP.md`
++in NFS-ModTools. Each tool runs on its own; there is no launcher.
++
++## Layout
++
++| Folder | Topic | File | Roadmap |
++|---|---|---|---|
++| `common/` | Chunk envelope, hashing, chunk inventory, chunk registry and probe, outputs helper | both | Shared base |
++| `scenery/` | Scenery info, instances, override groups, DAE-to-Blender matching | stream | Tier 1, items 1-3 |
++| `solids_materials/` | Solid/mesh reader, material dictionary viewer | stream | Tier 1, item 4 |
++| `flares/` | SolidMarkers (0x13401A) flares and flare packs | stream | Tier 1, item 5 |
++| `texture_anim/` | UV scroll and TextureAnimPack frame-swap | stream | Tier 1, item 7 |
++| `world_anim/` | world_anim chunks 0x37220-0x37270 | stream | Parser closed, playback open |
++| `emitters/` | EmitterLibrary / WorldFXTrigger to BeamNG particles | stream | Tier 2, port closed |
++| `triggers/` | Ambient audio event triggers (0x80036000 family) | stream | Tier 2, set aside |
++| `region/` | Region file parsers: relations, CARP, TrackPath | region | Out of scope |
++| `viewers/` | Region viewer and 3D viewer (use stream and region code) | both | Support |
++| `outputs/` | All generated and downloaded data. Local only, ignored by git | - | - |
++
++## Run
++
++Run each script from the repo root, for example:
++
++    python common/chunk_registry.py STREAML5RA.BUN --kind stream
++    python common/chunk_probe.py STREAML5RA.BUN 0x0003410D
++    python flares/flare_scenery_scan.py --help
++
++Most scanners accept `--help`. Each script has a docstring with the layout it reads.
++`tools.md` has one line for every tool. `tool_gaps.md` lists what each tool does not read.
++
++## Outputs rule
++
++Every tool writes generated files to `outputs/<tool-name>/`. Git ignores `outputs/`.
++Data files such as `hashes_main.txt`, `fx_triggers.tsv`, and dumps also stay in `outputs/`
++(local only). New tools get their folder from `common/nfs_outputs.py`:
++
++    from nfs_outputs import out_path
++    out_path("my_tool", "result.tsv")      # outputs/my_tool/result.tsv
++
++## Imports
++
++Scripts import shared modules by flat name (`from nfs_region_common import ...`).
++Each script that needs a shared module starts with a short bootstrap that adds
++`common/`, `region/`, `scenery/`, and `solids_materials/` to `sys.path`.
++When you add a script that imports one of these modules, copy the bootstrap from any
++existing script. New shared modules go in `common/`.
+diff --git a/common/chunk_probe.py b/common/chunk_probe.py
+new file mode 100644
+index 0000000..6792e97
+--- /dev/null
++++ b/common/chunk_probe.py
+@@ -0,0 +1,226 @@
++#!/usr/bin/env python3
++"""chunk_probe.py - inspect one chunk ID in a real file, to find its record layout.
++
++For every chunk with the given ID it shows offset, payload size, the 16-byte alignment
++pad (the game pads with 0x11), and a hex preview. Across all chunks it shows a size
++histogram and stride candidates (common divisors of the aligned data sizes). For a stride
++(guessed or given with --stride) it writes a per-column table: each 4-byte column's
++distinct values, min/max as u32, and whether it looks like a float, a small int, a
++constant, or zero.
++
++Usage:
++    python common/chunk_probe.py STREAML5RA.BUN 0x0003410D
++    python common/chunk_probe.py STREAML5RA.BUN 0x0013401A --size 92
++    python common/chunk_probe.py STREAML5RA.BUN 0x00135002 --stride 0x30 --records 6
++
++Options:
++    --size N       only chunks with this payload size, as listed by chunk_registry.py
++                   (includes the alignment pad). Example: the 44 size-92 chunks
++    --stride N     record size to test (default: best guess from the sizes)
++    --records N    records to dump in hex per chunk (default 4)
++    --max-chunks N chunks to detail (default 5; statistics use all chunks)
++    --hex-bytes N  bytes in the preview of each chunk (default 128)
++
++Output: outputs/chunk_probe/<id>_<file stem>.txt and ..._columns.tsv
++"""
++# stream bootstrap: make the shared library folders importable
++import pathlib as _pl, sys as _sys
++_sys.path[:0] = [str(_pl.Path(__file__).resolve().parents[1] / _d) for _d in ['common', 'region', 'scenery', 'solids_materials']]
++
++import argparse
++import math
++import mmap
++import pathlib
++import struct
++from collections import Counter
++from functools import reduce
++
++from nfs_outputs import out_path
++from nfs_region_common import walk_chunks
++
++TOOL_NAME = "chunk_probe"
++PAD_BYTE = 0x11
++COMMON_STRIDES = [0x08, 0x0C, 0x10, 0x14, 0x18, 0x1C, 0x20, 0x24, 0x28, 0x2C, 0x30, 0x40,
++                  0x44, 0x48, 0x50, 0x58, 0x5C, 0x60, 0x70, 0x80, 0x90, 0xA0]
++
++
++def align16(n):
++    return n if n % 16 == 0 else n + (16 - n % 16)
++
++
++def hexdump(buf, base):
++    lines = []
++    for i in range(0, len(buf), 16):
++        row = buf[i:i + 16]
++        lines.append("0x%08X  %-47s  %s" % (
++            base + i, " ".join("%02X" % b for b in row),
++            "".join(chr(b) if 32 <= b < 127 else "." for b in row)))
++    return "\n".join(lines)
++
++
++def collect(mm, chunk_id, size_filter):
++    found = []
++    for offset, raw_id, _hex, length, is_container, payload_start in walk_chunks(mm):
++        if int.from_bytes(raw_id, "little") != chunk_id:
++            continue
++        if size_filter is not None and length != size_filter:
++            continue
++        data_start = align16(payload_start)
++        pad = data_start - payload_start
++        pad_ok = pad == 0 or all(b == PAD_BYTE for b in mm[payload_start:data_start])
++        found.append({
++            "offset": offset, "length": length, "container": is_container,
++            "payload_start": payload_start, "data_start": data_start,
++            "data_len": max(0, payload_start + length - data_start),
++            "pad": pad, "pad_ok": pad_ok,
++        })
++    return found
++
++
++def stride_candidates(chunks):
++    """Strides that divide every aligned data size (or at least 90 percent of them)."""
++    sizes = [c["data_len"] for c in chunks if c["data_len"] > 0]
++    if not sizes:
++        return [], 0
++    g = reduce(math.gcd, sizes)
++    cands = []
++    for s in COMMON_STRIDES:
++        fit = sum(1 for n in sizes if n % s == 0)
++        if fit == len(sizes):
++            cands.append((s, fit, len(sizes)))
++        elif fit >= 0.9 * len(sizes):
++            cands.append((s, fit, len(sizes)))
++    return cands, g
++
++
++def classify(values):
++    """Describe one 4-byte column from a list of raw u32 values."""
++    distinct = len(set(values))
++    if distinct == 1:
++        v = values[0]
++        return "zero" if v == 0 else "constant"
++    floats_ok = True
++    for v in values:
++        f = struct.unpack("<f", struct.pack("<I", v))[0]
++        if v != 0 and (not math.isfinite(f) or abs(f) > 1e7 or abs(f) < 1e-9):
++            floats_ok = False
++            break
++    if floats_ok:
++        return "float?"
++    if max(values) < 0x10000:
++        return "small int"
++    return "u32/hash"
++
++
++def column_table(mm, chunks, stride):
++    cols = [[] for _ in range(stride // 4)]
++    records = 0
++    for c in chunks:
++        n = c["data_len"] // stride
++        for r in range(n):
++            base = c["data_start"] + r * stride
++            for k in range(stride // 4):
++                cols[k].append(struct.unpack_from("<I", mm, base + 4 * k)[0])
++            records += 1
++    rows = []
++    for k, vals in enumerate(cols):
++        if not vals:
++            continue
++        rows.append({
++            "offset": "0x%02X" % (4 * k), "distinct": len(set(vals)),
++            "min_u32": "0x%08X" % min(vals), "max_u32": "0x%08X" % max(vals),
++            "kind": classify(vals),
++            "sample": " ".join("0x%08X" % v for v in vals[:4]),
++        })
++    return rows, records
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("file")
++    ap.add_argument("chunk_id", type=lambda s: int(s, 0))
++    ap.add_argument("--size", type=lambda s: int(s, 0), default=None)
++    ap.add_argument("--stride", type=lambda s: int(s, 0), default=None)
++    ap.add_argument("--records", type=int, default=4)
++    ap.add_argument("--max-chunks", type=int, default=5)
++    ap.add_argument("--hex-bytes", type=int, default=128)
++    args = ap.parse_args()
++
++    stem = pathlib.Path(args.file).stem
++    tag = "%08X_%s" % (args.chunk_id, stem) + ("_size%d" % args.size if args.size else "")
++    report_path = out_path(TOOL_NAME, tag + ".txt")
++    columns_path = out_path(TOOL_NAME, tag + "_columns.tsv")
++
++    lines = []
++    p = lines.append
++    with open(args.file, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as mm:
++        chunks = collect(mm, args.chunk_id, args.size)
++        p("chunk 0x%08X in %s: %d chunk(s)%s" % (
++            args.chunk_id, args.file, len(chunks),
++            " (payload size %d only)" % args.size if args.size else ""))
++        if not chunks:
++            print("\n".join(lines))
++            print("No chunk with this ID. Run chunk_registry.py to list the IDs in the file.")
++            return
++        p("container bit set: %s" % ("yes" if chunks[0]["container"] else "no"))
++        p("")
++        hist = Counter(c["length"] for c in chunks)
++        p("Payload size histogram (size: count):")
++        for size, cnt in sorted(hist.items(), key=lambda kv: (-kv[1], kv[0]))[:25]:
++            p("  %d (0x%X): %d" % (size, size, cnt))
++        bad_pad = sum(1 for c in chunks if not c["pad_ok"])
++        p("Alignment pad not all 0x%02X in %d chunk(s)" % (PAD_BYTE, bad_pad))
++        p("")
++
++        cands, g = stride_candidates(chunks)
++        p("gcd of aligned data sizes: %d (0x%X)" % (g, g))
++        p("Stride candidates (divides all or 90 percent of sizes): " +
++          (", ".join("0x%X (%d/%d)" % c for c in cands) if cands else "none"))
++        stride = args.stride
++        if stride is None:
++            exact = [c for c in cands if c[1] == c[2]]
++            pick = exact[-1][0] if exact else (cands[-1][0] if cands else None)
++            stride = pick if pick and pick <= 0x100 else None
++            if stride:
++                p("Stride used for columns (largest exact candidate): 0x%X. Override with --stride." % stride)
++        p("")
++
++        for i, c in enumerate(chunks[:args.max_chunks]):
++            p("--- chunk %d at 0x%X: payload %d bytes, data starts 0x%X (pad %d%s), aligned data %d bytes" % (
++                i, c["offset"], c["length"], c["data_start"], c["pad"],
++                "" if c["pad_ok"] else " NOT 0x11", c["data_len"]))
++            p(hexdump(mm[c["data_start"]:c["data_start"] + args.hex_bytes], c["data_start"]))
++            if stride and c["data_len"] >= stride:
++                n = min(args.records, c["data_len"] // stride)
++                p("  first %d record(s), stride 0x%X:" % (n, stride))
++                for r in range(n):
++                    base = c["data_start"] + r * stride
++                    p("  [%d] " % r + " ".join("%08X" % struct.unpack_from("<I", mm, base + k)[0]
++                                                for k in range(0, stride, 4)))
++            p("")
++
++        if stride:
++            rows, nrec = column_table(mm, chunks, stride)
++            with open(columns_path, "w", encoding="utf-8") as f:
++                f.write("offset\tdistinct\tmin_u32\tmax_u32\tkind\tsample\n")
++                for r in rows:
++                    f.write("\t".join(str(r[k]) for k in ("offset", "distinct", "min_u32",
++                                                          "max_u32", "kind", "sample")) + "\n")
++            p("Column table (%d records, stride 0x%X) written to %s" % (nrec, stride, columns_path))
++            for r in rows:
++                p("  +%s  distinct=%-6d %-9s min=%s max=%s" % (
++                    r["offset"], r["distinct"], r["kind"], r["min_u32"], r["max_u32"]))
++            if any(c["data_len"] % stride for c in chunks):
++                p("WARNING: not every chunk's data size is a multiple of 0x%X. "
++                  "The stride may be wrong, or records may have a header." % stride)
++        else:
++            p("No stride chosen. Give one with --stride to get the column table.")
++
++    text = "\n".join(lines)
++    report_path.write_text(text + "\n", encoding="utf-8")
++    print(text)
++    print("\nWrote %s" % report_path)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/common/chunk_registry.py b/common/chunk_registry.py
+new file mode 100644
+index 0000000..84944db
+--- /dev/null
++++ b/common/chunk_registry.py
+@@ -0,0 +1,139 @@
++#!/usr/bin/env python3
++"""chunk_registry.py - compare the chunk IDs in a real file with chunk_registry.tsv.
++
++Reports, for each chunk ID found in the file: count, size range, registry file label
++(stream / region / unlabeled), status, and owning tool. Flags:
++  UNREGISTERED   chunk ID is in the file but not in the registry
++  LABEL-MISMATCH the registry label differs from --kind (for example a region chunk
++                 found in a stream file)
++  NOT-FOUND      registry row has no chunk of that ID in this file
++
++Usage:
++    python common/chunk_registry.py STREAML5RA.BUN --kind stream
++    python common/chunk_registry.py L5RA.BUN --kind region
++    python common/chunk_registry.py FILE.BUN --registry my_registry.tsv
++
++Output: outputs/chunk_registry/<file stem>_coverage.tsv (also a printed summary).
++"""
++# stream bootstrap: make the shared library folders importable
++import pathlib as _pl, sys as _sys
++_sys.path[:0] = [str(_pl.Path(__file__).resolve().parents[1] / _d) for _d in ['common', 'region', 'scenery', 'solids_materials']]
++
++import argparse
++import mmap
++import pathlib
++from collections import defaultdict
++
++from nfs_outputs import out_path
++from nfs_region_common import walk_chunks
++
++TOOL_NAME = "chunk_registry"
++DEFAULT_REGISTRY = pathlib.Path(__file__).resolve().parent / "chunk_registry.tsv"
++
++
++def load_registry(path):
++    """Return {chunk_id: row dict}. Lines starting with # are comments."""
++    rows = {}
++    header = None
++    with open(path, encoding="utf-8") as f:
++        for line in f:
++            line = line.rstrip("\n")
++            if not line or line.startswith("#"):
++                continue
++            cols = line.split("\t")
++            if header is None:
++                header = cols
++                continue
++            row = dict(zip(header, cols + [""] * (len(header) - len(cols))))
++            rows[int(row["chunk_id"], 16)] = row
++    return rows
++
++
++def scan_file(path):
++    """Return {chunk_id: [count, total, min, max, first_offset]}."""
++    stats = {}
++    with open(path, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as mm:
++        for offset, raw_id, _hex, length, _is_container, _start in walk_chunks(mm):
++            cid = int.from_bytes(raw_id, "little")
++            s = stats.get(cid)
++            if s is None:
++                stats[cid] = [1, length, length, length, offset]
++            else:
++                s[0] += 1
++                s[1] += length
++                s[2] = min(s[2], length)
++                s[3] = max(s[3], length)
++    return stats
++
++
++def build_rows(stats, registry, kind):
++    rows = []
++    for cid in sorted(stats):
++        count, total, lo, hi, first = stats[cid]
++        reg = registry.get(cid)
++        flags = []
++        if reg is None:
++            flags.append("UNREGISTERED")
++        elif kind and reg["file"] not in (kind, "unlabeled"):
++            flags.append("LABEL-MISMATCH")
++        rows.append({
++            "chunk_id": "0x%08X" % cid, "count": count, "total_bytes": total,
++            "min_size": lo, "max_size": hi, "first_offset": "0x%X" % first,
++            "file": reg["file"] if reg else "", "status": reg["status"] if reg else "",
++            "tool": reg["tool"] if reg else "", "name": reg["name"] if reg else "",
++            "flags": ",".join(flags),
++        })
++    for cid, reg in sorted(registry.items()):
++        if kind and reg["file"] not in (kind, "unlabeled"):
++            continue  # a region chunk is not expected in a stream file
++        if cid not in stats:
++            rows.append({
++                "chunk_id": "0x%08X" % cid, "count": 0, "total_bytes": 0, "min_size": "",
++                "max_size": "", "first_offset": "", "file": reg["file"], "status": reg["status"],
++                "tool": reg["tool"], "name": reg["name"], "flags": "NOT-FOUND",
++            })
++    return rows
++
++
++COLS = ["chunk_id", "count", "total_bytes", "min_size", "max_size", "first_offset",
++        "file", "status", "tool", "name", "flags"]
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("file", help="Stream or region .BUN file")
++    ap.add_argument("--kind", choices=["stream", "region"], help="Which file type this is")
++    ap.add_argument("--registry", default=str(DEFAULT_REGISTRY), help="Path to chunk_registry.tsv")
++    ap.add_argument("--out", help="Output TSV (default outputs/chunk_registry/<stem>_coverage.tsv)")
++    args = ap.parse_args()
++
++    registry = load_registry(args.registry)
++    stats = scan_file(args.file)
++    rows = build_rows(stats, registry, args.kind)
++
++    out = pathlib.Path(args.out) if args.out else out_path(
++        TOOL_NAME, pathlib.Path(args.file).stem + "_coverage.tsv")
++    with open(out, "w", encoding="utf-8") as f:
++        f.write("\t".join(COLS) + "\n")
++        for r in rows:
++            f.write("\t".join(str(r[c]) for c in COLS) + "\n")
++
++    by_flag = defaultdict(list)
++    for r in rows:
++        for fl in (r["flags"].split(",") if r["flags"] else ["ok"]):
++            by_flag[fl].append(r)
++    print(f"{args.file}: {len(stats)} distinct chunk IDs, registry has {len(registry)} rows")
++    for fl in ("UNREGISTERED", "LABEL-MISMATCH", "NOT-FOUND"):
++        print(f"\n{fl}: {len(by_flag.get(fl, []))}")
++        for r in by_flag.get(fl, [])[:40]:
++            print(f"  {r['chunk_id']}  x{r['count']}  sizes {r['min_size']}-{r['max_size']}  {r['name']}")
++    status = defaultdict(int)
++    for r in rows:
++        if r["count"]:
++            status[r["status"] or "(none)"] += 1
++    print("\nFound chunk IDs by status: " + ", ".join(f"{k}={v}" for k, v in sorted(status.items())))
++    print(f"\nWrote {out}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/common/chunk_registry.tsv b/common/chunk_registry.tsv
+new file mode 100644
+index 0000000..a073ce3
+--- /dev/null
++++ b/common/chunk_registry.tsv
+@@ -0,0 +1,56 @@
++# Hand-maintained chunk registry. One row per chunk ID.
++# file: stream | region | unlabeled (label before any reader is written).
++# status: done | partial | scan-only | unread | set-aside | out-of-scope
++# Edit this file when a tool starts or stops reading a chunk.
++chunk_id	name	file	status	tool	roadmap	note
++0x80034100	ScenerySection (container)	stream	done	scenery/nfs_stream_scenery.py	T1.1-3	one per section; children below
++0x00034101	Scenery header	stream	partial	scenery/nfs_stream_scenery.py	T1.1	only section number (+0x0C) read
++0x00034102	SceneryInfo array (0x48 each)	stream	partial	scenery/nfs_stream_scenery.py	T1.1	name, first solid key, flags read; keys 2-4 unread
++0x00034103	SceneryInstance array (0x60 each)	stream	partial	scenery/nfs_stream_scenery.py	T1.2	flags, position, rotation, guid, info index read
++0x00034105	Scenery tree nodes	stream	unread		T2	completeness tier
++0x00034107	Scenery preculler	stream	unread		T2	keep raw bytes
++0x00034108	Scenery override infos (6 bytes each)	stream	done	scenery/nfs_stream_scenery.py	T1.3	-
++0x00034109	Scenery groups	stream	done	scenery/nfs_stream_scenery.py	T1.3	-
++0x0003410D	Light texture collections	stream	unread		T2	-
++0x80134000	ObjectPack (container)	stream	partial	solids_materials/nfs_solid_reader.py	T1.4	-
++0x80134010	Solid object (container)	stream	done	solids_materials/nfs_solid_reader.py	T1.4	-
++0x00134011	Solid header	stream	partial	solids_materials/nfs_solid_reader.py	T1.4	version, hash, bounds, name read
++0x00134012	Solid texture list	stream	partial	solids_materials/nfs_solid_reader.py	T1.4	first u32 of each 8-byte entry read
++0x0013401A	SolidMarkers (position_marker, 0x50 each)	stream	partial	flares/flare_scenery_scan.py	T1.5	44 chunks at size 92 unexplained
++0x0013401D	Solid morph targets	stream	done	solids_materials/nfs_solid_reader.py	T1.4	-
++0x80134100	Solid Plat (container)	stream	done	solids_materials/nfs_solid_reader.py	T1.4	-
++0x00134B01	Plat vertex buffer	stream	done	solids_materials/nfs_solid_reader.py	T1.4	-
++0x00134B02	Plat mesh entries (shading groups, 144 bytes)	stream	partial	solids_materials/nfs_solid_reader.py	T1.4	see tool_gaps.md
++0x00134B03	Plat indices	stream	done	solids_materials/nfs_solid_reader.py	T1.4	-
++0x00134C02	Plat mesh entry name	stream	done	solids_materials/nfs_solid_reader.py	T1.4	-
++0x00135002	Light AABB	stream	unread		T2	-
++0x00135200	Flare pack (flare::pack + flare::instance)	stream	scan-only	flares/flare_scan.py	T1.5	ID found by discovery mode
++0x33310004	TextureStruct array (0x58 each)	stream	partial	texture_anim/uv_scroll_dump.py	T1.7	UV scroll fields only
++0x33312001	TextureAnimPack header	stream	scan-only	texture_anim/texture_anim_scan.py	T1.7	layout confirmed on two samples
++0x33312002	TextureAnimPack frames (12 bytes each)	stream	scan-only	texture_anim/texture_anim_scan.py	T1.7	first u32 of each entry read
++0xB3312000	TextureAnimPack pack (container)	stream	scan-only	texture_anim/texture_anim_scan.py	T1.7	hex dump only
++0xB3312004	TextureAnimPack inst (container)	stream	scan-only	texture_anim/texture_anim_scan.py	T1.7	hex dump only
++0x00037220	world_anim header	stream	done	world_anim/world_anim_scan.py	closed	-
++0x00037240	world_anim frames	stream	done	world_anim/parse_2600_anims.py	closed	-
++0x00037250	world_anim rtnode	stream	partial	world_anim/dump_worldanim_2400.py	closed	playback items open
++0x00037260	world_anim counts	stream	done	world_anim/world_anim_scan.py	closed	-
++0x00037270	world_anim endptr	stream	done	world_anim/world_anim_scan.py	closed	-
++0x0003BC00	EmitterLibrary / WorldFXTrigger (0x50 each)	stream	partial	emitters/dump_fx_trigger_matrices.py	T2	0x30 block undecoded
++0x80036000	EventTriggerPack (container)	stream	set-aside	triggers/world_event_trigger_scan.py	T2	ambient audio triggers
++0x00036001	EventTrigger header	stream	set-aside	triggers/world_event_trigger_scan.py	T2	-
++0x00036002	EventTrigger AABB tree	stream	set-aside	triggers/world_event_trigger_scan.py	T2	leaves sampled only
++0x00036003	EventTrigger records	stream	set-aside	triggers/world_event_trigger_scan.py	T2	-
++0x0003B801	unknown (not CARP 0x3B800)	unlabeled	unread		T2	hex-check first
++0x0003B802	unknown (not CARP 0x3B800)	unlabeled	unread		T2	hex-check first
++0x00034027	unknown	unlabeled	unread		T2	-
++0x00034191	unknown	unlabeled	unread		T2	-
++0x00034110	unknown (0x34110-0x34113)	unlabeled	unread		T2	-
++0x00034111	unknown (0x34110-0x34113)	unlabeled	unread		T2	-
++0x00034112	unknown (0x34110-0x34113)	unlabeled	unread		T2	-
++0x00034113	unknown (0x34110-0x34113)	unlabeled	unread		T2	-
++0x80034147	TrackPathManager (container)	region	out-of-scope	region/nfs_trackpath.py	region	-
++0x0003414A	TrackPath zones	region	out-of-scope	region/nfs_trackpath.py	region	-
++0x0003414D	TrackPath barriers	region	out-of-scope	region/nfs_trackpath.py	region	-
++0x80034150	VisibleSections (container)	region	out-of-scope	region/nfs_region_parser.py	region	-
++0x00034153	VisibleSections boundaries	region	out-of-scope	region/nfs_region_parser.py	region	-
++0x0003B800	CARP world grid	region	out-of-scope	region/nfs_carp_parser.py	region	own offset-table format
+diff --git a/common/nfs_hash_dictionary.py b/common/nfs_hash_dictionary.py
+index 2f1cd40..d4d01e7 100644
+--- a/common/nfs_hash_dictionary.py
++++ b/common/nfs_hash_dictionary.py
+@@ -1,10 +1,10 @@
+ """
+ Loads a plain wordlist (one candidate string per line, '#' comments
+-allowed) from the same directory as this file - NOT embedded in the code -
++allowed) from outputs/hashes_main.txt (local only, not in git) - NOT embedded in the code -
+ and hashes every line with bin_hash() to build a reverse hash->name lookup.
+ 
+ Point this at CiPH3R-88/NFS_Raider_v2.0's hashes_main.txt (or any similarly-
+-shaped wordlist) by dropping it next to these scripts as hashes_main.txt.
++shaped wordlist) by dropping it into the repo's outputs/ folder as hashes_main.txt.
+ Kept external and optional: nothing in this project requires this file to
+ be present, it just resolves more names when it is.
+ """
+@@ -15,8 +15,9 @@ _sys.path[:0] = [str(_pl.Path(__file__).resolve().parents[1] / _d) for _d in ['c
+ import os
+ 
+ from nfs_hashing import bin_hash
++from nfs_outputs import OUTPUTS
+ 
+-_DEFAULT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hashes_main.txt")
++_DEFAULT_PATH = os.path.join(str(OUTPUTS), "hashes_main.txt")
+ 
+ _cache = {}  # path -> {hash: name}
+ 
+diff --git a/common/nfs_outputs.py b/common/nfs_outputs.py
+new file mode 100644
+index 0000000..493fc47
+--- /dev/null
++++ b/common/nfs_outputs.py
+@@ -0,0 +1,22 @@
++"""Shared output-folder helper.
++
++Rule for every tool in this repo: generated files go to
++<repo root>/outputs/<tool-name>/. Git ignores outputs/ (local only).
++A tool may still accept an explicit path on the command line.
++"""
++import pathlib
++
++REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
++OUTPUTS = REPO_ROOT / "outputs"
++
++
++def out_dir(tool_name):
++    """Return outputs/<tool_name>/ and create it if needed."""
++    d = OUTPUTS / tool_name
++    d.mkdir(parents=True, exist_ok=True)
++    return d
++
++
++def out_path(tool_name, filename):
++    """Return outputs/<tool_name>/<filename>. The folder is created."""
++    return out_dir(tool_name) / filename
+diff --git a/tool_gaps.md b/tool_gaps.md
+new file mode 100644
+index 0000000..89c3470
+--- /dev/null
++++ b/tool_gaps.md
+@@ -0,0 +1,108 @@
++# What the tools do not fully read
++
++Source: reading the code in this repo (2026-10-03). Items marked (doc) come from a
++docstring or comment, not from running the tool. No tool here was run on a real file for
++this list. Byte ranges are offsets inside one record.
++
++## scenery/
++
++**nfs_stream_scenery.py** (Tier 1, items 1-3)
++- Header 0x34101: only the section number (+0x0C) is read. The rest is dropped.
++- SceneryInfo 0x34102 (0x48 bytes): reads name (24 bytes), the first solid key (+0x18), and flags (+0x3C).
++  Not read: the other three solid keys (+0x1C, +0x20, +0x24), +0x28..+0x3B, +0x40..+0x47.
++  `flares/flare_scenery_scan.py` reads `solid_keys[4]` on its own. This module does not.
++- SceneryInstance 0x34103 (0x60 bytes): reads flags, position, rotation, guid, info index.
++  Not read: +0x00..+0x0B, +0x10..+0x1F, +0x56..+0x5F.
++- Other chunks inside a 0x80034100 section are skipped: 0x34105 tree nodes, 0x34107 preculler, 0x3410D.
++- Override infos (0x34108) and groups (0x34109): every field is read. No gap.
++- (doc) Not run against a real file.
++
++**nfs_scenery_dae_scan.py** (doc) Not verified against a real exported .dae.
++**nfs_scn_ref_match.py** (doc) First empirical check, not a finished pipeline.
++
++## solids_materials/
++
++**nfs_solid_reader.py** (Tier 1, item 4)
++- Solid header 0xA0 bytes: reads version, hash, bounds, name. Pivot matrix and marker count are not exposed.
++  `flare_scenery_scan.py` reads them itself.
++- Shading group (144 bytes): reads bounds (+0x00..+0x17), six texture-slot bytes (+0x18..+0x1D),
++  effect id (+0x30), flags (+0x38), sort key (+0x3C), vertex count (+0x40), triangle count (+0x60).
++  The light material number (+0x1D) is read, then discarded. Everything else is unread:
++  +0x1E..+0x2F, +0x32..+0x37, +0x44..+0x5F, +0x64..+0x8F.
++- Texture list 0x134012: the first u32 of each 8-byte entry is read. The second u32 is dropped.
++- Skipped on purpose (code comment): light materials, position markers (0x13401A), plat info, UCAP frame weights.
++- (doc) Not run against a real file.
++
++**carbon_material_viewer.py** shows `carbon_material_dictionary.json` from AssetDumper. It does not read the stream file.
++
++## flares/
++
++**flare_scenery_scan.py** (Tier 1, item 5)
++- Reads one LOD only (`--lod`, default 2). Flares on solids in the other LODs are not found.
++- Reads instance flags and writes them to the output, but does not apply them. A flare on an excluded instance still appears.
++- Does not apply override groups, so a flare on a group-disabled instance still appears.
++- Skips section 2600 unless `--include-2600` is set.
++- Reads only 0x50-byte markers. The 44 chunks at size 92 are not explained (roadmap).
++
++**flare_marker_scan.py** Discovery accepts only 0x50 records with a 0, 4, or 8-byte prefix. Other record sizes are not found.
++**flare_scan.py** Reads the layout in its docstring (pack 0x60, instance 0x30). The instance flags byte (+0x2D) is printed raw, not decoded.
++**flare_report.py**, **find_flare_hashes.py** Work from the Carbon exe and the vault yml. They do not read the stream file.
++
++## texture_anim/ (the gap we saw before)
++
++**texture_anim_scan.py** (Tier 1, item 7)
++- Scanner only. It prints text. There is no TSV or JSON output for a viewer or exporter.
++- Header (0x33312001): reads name, key, frame count, fps, time base (up to +0x1F). Two zero gaps (8 and 12 bytes)
++  in the header are not identified (doc). Nothing after +0x1F is read.
++- Frames (0x33312002): the first u32 of each 12-byte entry is read as the frame hash. The other 8 bytes
++  of each entry are not decoded.
++- Containers 0xB3312000 and 0xB3312004: hex dump only. No decode.
++- Frame hashes are not resolved to texture names.
++- (doc) The docstring says to point it at a .TPK, not the stream file. The roadmap says the chunks are in STREAML5RA.BUN. Check which is right.
++
++**uv_scroll_dump.py** Reads 11 fields of the 88-byte TextureStruct (0x33310004): hash, size, tilable UV,
++scroll type, timestep, speeds, offset, scale. Not read: alpha blend type, alpha usage type, alpha sort,
++bias level, flags, rendering order, mipmap bias. (The C# reader keeps these; see the audit.)
++
++## world_anim/ (parser closed, playback open)
++
++- (doc) `unknown_0x6e` is unconfirmed. The raw flags byte (+0x4A) bits 0x08, 0x10, 0x20 are printed but not confirmed.
++- (doc) Open for playback: oscillation formula, delay source, timescale byte.
++- (doc) Library and parent anim borrowing (`use_library_anim`, `use_parent_anim`) is only bucketed and counted. Nothing resolves the borrow.
++- **parse_2400_anims.py** uses a field table that `dump_worldanim_2400.py` calls wrong. Use `dump_worldanim_2400.py`.
++- **parse_2600_anims.py** pairs a frames chunk with its rtnode only when the frames chunk comes right after. Other cases print a warning.
++
++## emitters/
++
++- **dump_fx_trigger_matrices.py** The 0x30 block of each 0x50-byte WorldFXTrigger record is still undecoded. The tool only tests it as a rotation matrix.
++- **extract_emitters.py** Does not read the stream file. It needs `fx_triggers.tsv` from the C# AssetDumper command and Attribulator yml files.
++  Hash-only texture names stay unresolved unless you give it the texture folder.
++- **build_beamng_particles.py** Skips layers with emission rate 0 and linked layers. Applies only the Z part of Accel (it counts the horizontal part as ignored).
++
++## triggers/
++
++**world_event_trigger_scan.py** Decoded as ambient audio triggers (set aside). The AABB tree (0x36002) leaves are sampled (`--leaf-samples`), not fully decoded.
++
++## region/ (out of scope for the stream roadmap)
++
++- **nfs_trackpath.py**, **track_path_zone_reader.py** Zone `user_data` is a runtime pointer, kept raw. `data[4]` is kept raw. Barriers are fully read.
++- **nfs_carp_parser.py** (doc) Container offsets are confirmed on a ProStreet file. Field values are not checked.
++- **nfs_region_undercover.py** (doc) Ported from UCGT. Not checked on a real Undercover file.
++- **nfs_region_mw.py** (doc) Derived from decompiled source. Not hex-verified.
++- **nfs_region_common.py** `ChunkBoundary` fields `unk2` and `unk3` have no known meaning.
++
++## common/
++
++**nfs_chunk_inventory.py** Prints only. Its watch list has 13 IDs. Use `chunk_registry.py` for coverage against all known IDs.
++
++## What this means for the roadmap
++
++| Roadmap item | Gap |
++|---|---|
++| T1.1 SceneryInfo | Solid keys 2-4 not read in `nfs_stream_scenery.py` |
++| T1.2 SceneryInstance | Flags read, but three byte ranges unread; flare tool does not apply them |
++| T1.4 Materials | Shading group bytes +0x1E..+0x2F and others unread; texture list second u32 dropped |
++| T1.5 SolidMarkers | One LOD only; 44 size-92 chunks open; flags and groups not applied |
++| T1.7 Texture anim | Scanner only: no structured output, frame entry bytes 4-11 and inst/pack containers unread |
++| T2 emitters | 0x30 block undecoded |
++| T2 unread chunks | 0x34105, 0x34107, 0x3410D, 0x135002, 0x3B801/2, unknown IDs have no tool yet |
+diff --git a/tools.md b/tools.md
+index 7cca658..2854ebf 100644
+--- a/tools.md
++++ b/tools.md
+@@ -1,5 +1,9 @@
+ # Tools
+ 
++Rule: every tool writes generated files to `outputs/<tool-name>/` (git ignores `outputs/`).
++New tools use `common/nfs_outputs.py` for this. Older tools are listed in `tool_gaps.md`
++with what they do not fully read.
++
+ Path | Purpose
+ --- | ---
+ **common/** |
+@@ -8,6 +12,9 @@ Path | Purpose
+ `common/nfs_hash_dictionary.py` | Reverse hash lookup from `hashes_main.txt`
+ `common/nfs_hash_lookup_gui.py` | GUI: resolve a hex hash with both NFS hash algorithms
+ `common/nfs_chunk_inventory.py` | List every distinct chunk ID in a file (count, sizes, first offset)
++`common/nfs_outputs.py` | Helper: `out_dir(tool)` returns `outputs/<tool>/`
++`common/chunk_registry.py` | Compare a file's chunk IDs with `chunk_registry.tsv` (unregistered, label mismatch, not found)
++`common/chunk_probe.py` | Inspect one chunk ID: sizes, stride guess, per-column table, hex records
+ **scenery/** |
+ `scenery/nfs_stream_scenery.py` | Reader: scenery instances, override groups (0x34108/9)
+ `scenery/nfs_scenery_dae_scan.py` | Read per-section DAE nodes (identity and transform)

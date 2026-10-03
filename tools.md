@@ -1,5 +1,9 @@
 # Tools
 
+Rule: every tool writes generated files to `outputs/<tool-name>/` (git ignores `outputs/`).
+New tools use `common/nfs_outputs.py` for this. Older tools are listed in `tool_gaps.md`
+with what they do not fully read.
+
 Path | Purpose
 --- | ---
 **common/** |
@@ -8,6 +12,9 @@ Path | Purpose
 `common/nfs_hash_dictionary.py` | Reverse hash lookup from `hashes_main.txt`
 `common/nfs_hash_lookup_gui.py` | GUI: resolve a hex hash with both NFS hash algorithms
 `common/nfs_chunk_inventory.py` | List every distinct chunk ID in a file (count, sizes, first offset)
+`common/nfs_outputs.py` | Helper: `out_dir(tool)` returns `outputs/<tool>/`
+`common/chunk_registry.py` | Compare a file's chunk IDs with `chunk_registry.tsv` (unregistered, label mismatch, not found)
+`common/chunk_probe.py` | Inspect one chunk ID: sizes, stride guess, per-column table, hex records
 **scenery/** |
 `scenery/nfs_stream_scenery.py` | Reader: scenery instances, override groups (0x34108/9)
 `scenery/nfs_scenery_dae_scan.py` | Read per-section DAE nodes (identity and transform)
