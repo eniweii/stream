@@ -40,12 +40,14 @@ this list. Byte ranges are offsets inside one record.
 **flare_scenery_scan.py** (Tier 1, item 5)
 - Reads one LOD only (`--lod`, default 2). Flares on solids in the other LODs are not found.
 - Reads instance flags and writes them to the output, but does not apply them. A flare on an excluded instance still appears.
-- Does not apply override groups, so a flare on a group-disabled instance still appears.
+- Reads the override tables (0x34108 infos, 0x34109 groups) and writes `in_override`, `override_groups`, `override_names`, `override_flags` per flare. It does not drop flares. The BeamNG streamer hides them through `sectionOverrideName`.
+- Override padding rules are picked by trying both and checking the chunk end. Not confirmed on more than one file (doc).
 - Skips section 2600 unless `--include-2600` is set.
 - Reads only 0x50-byte markers. The 44 chunks at size 92 are not explained (roadmap).
 
 **flare_scan.py** Reads the layout in its docstring (pack 0x60, instance 0x30). The instance flags byte (+0x2D) is printed raw, not decoded.
 **flare_report.py**, **find_flare_hashes.py** Work from the Carbon exe and the vault yml. They do not read the stream file.
+`beamng/flares/flare_lights_beamng.py` reads the `L0_*` and `L1_*` color columns that `flare_report.py --enriched` writes. It also looks for `L0_param` and `L1_param`, but the column is named `L0_params` and `L1_params`. This does no harm: a layer is found through `L0_r` and `L1_r`, which are empty when the layer has no vault entry.
 
 ## texture_anim/ (the gap we saw before)
 

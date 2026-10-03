@@ -27,8 +27,8 @@ Path | Purpose
 `solids_materials/carbon_material_viewer.py` | GUI viewer for `carbon_material_dictionary.json`
 **flares/** |
 `flares/flare_scan.py` | Flare packs (flare::pack, flare::instance)
-`flares/flare_scenery_scan.py` | World positions of all scenery flares
-`flares/flare_report.py` | Join flare TSV with vault `light_flares_cg.yml`
+`flares/flare_scenery_scan.py` | World positions of all scenery flares, with override group columns (`--hashes` names the groups)
+`flares/flare_report.py` | Join flare TSV with vault `light_flares_cg.yml`. `--enriched` adds the `L0_*` / `L1_*` color columns
 `flares/find_flare_hashes.py` | Find flare type table in the Carbon exe
 **texture_anim/** |
 `texture_anim/texture_anim_scan.py` | Scan TextureAnimPack chunks (frame-swap)
@@ -55,3 +55,10 @@ Path | Purpose
 `viewers/nfs_3d_viewer.py` | 3D viewer with camera-based streaming
 **beamng/** (reads middleman files, writes BeamNG formats) |
 `beamng/particles/build_beamng_particles.py` | Step 3: `emitters_resolved.json` to BeamNG particle JSON
+`beamng/flares/flare_lights_beamng.py` | Flare TSV to BeamNG PointLights (`items.level.json`), with `sectionID` and `sectionOverrideName`
+
+## Flare pipeline (stream file to BeamNG lights)
+
+    python flares/flare_scenery_scan.py STREAML5RA.BUN --hashes common/hashes_main.txt --tsv outputs/flares/flares.tsv
+    python flares/flare_report.py outputs/flares/flares.tsv light_flares_cg.yml --enriched outputs/flares/flares_full.tsv
+    python beamng/flares/flare_lights_beamng.py        (file picker: choose flares_full.tsv; writes items.level.json next to it)
