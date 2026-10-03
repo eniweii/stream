@@ -41,7 +41,6 @@ Path | Purpose
 `world_anim/nfs_anim_name_match.py` | Match instance names to rtnode data
 **emitters/** |
 `emitters/extract_emitters.py` | Step 1: resolve emitters from Attribulator yml and `fx_triggers.tsv`
-`emitters/build_beamng_particles.py` | Step 3: write BeamNG particle JSON
 **triggers/** |
 `triggers/world_event_trigger_scan.py` | Scanner for 0x80036000 event triggers
 **region/** (region file, out of scope) |
@@ -50,6 +49,9 @@ Path | Purpose
 `region/diagnose_relations.py` | Check unk1/dataCount in ChunksRelated
 `region/nfs_carp_parser.py` | CARP world grid and road network
 `region/nfs_trackpath.py` | TrackPath zones and barriers
+`region/export_sections.py` | Write `sections.json` (drivable boundaries + related IDs) from a region and a stream file. The viewer button uses it
 **viewers/** |
 `viewers/nfs_region_viewer.py` | Tkinter viewer: boundaries and relations
 `viewers/nfs_3d_viewer.py` | 3D viewer with camera-based streaming
+**beamng/** (reads middleman files, writes BeamNG formats) |
+`beamng/particles/build_beamng_particles.py` | Step 3: `emitters_resolved.json` to BeamNG particle JSON

@@ -25,6 +25,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from nfs_region_parser import load_region_file, GAME_PARSERS, get_label_functions
+from export_sections import build_sections, write_sections_json
 from nfs_region_common import section_letter as _default_section_letter
 from nfs_region_common import format_section_label as _default_format_section_label
 from nfs_region_common import section_subsection
@@ -1312,31 +1313,7 @@ class RegionViewerApp(tk.Tk):
                 "real data before they're written out.")
             return
 
-        def missing_reasons(i):
-            reasons = []
-            if i not in self.world.by_id:
-                reasons.append("no boundary")
-            if not self.stream_scenery.has_data_for(i):
-                reasons.append("no stream data")
-            return reasons
-
-        sections = []
-        boundaryless_kept = set()
-        for b in self.world.boundaries:
-            if not self.world.is_drivable(b.ID):
-                continue
-            rel = self.world.relations_by_id.get(b.ID)
-            visible_ids = getattr(rel, 'visible_related_chunk_ids', rel.relatedChunkIDs if rel else [])
-            # Drop only IDs missing BOTH a boundary and stream data (non-existent).
-            related = [i for i in visible_ids if len(missing_reasons(i)) < 2]
-            boundaryless_kept.update(i for i in related if i not in self.world.by_id)
-            sections.append({
-                "id": b.ID,
-                "points": [[round(x, 3), round(y, 3)] for x, y in b.points],
-                "boundsMin": [round(b.boundsMin[0], 3), round(b.boundsMin[1], 3)],
-                "boundsMax": [round(b.boundsMax[0], 3), round(b.boundsMax[1], 3)],
-                "related": related,
-            })
+        sections, boundaryless_kept = build_sections(self.world, self.stream_scenery)
 
         if not sections:
             messagebox.showwarning("Export sections.json", "No drivable sections found - nothing to export.")
@@ -1347,8 +1324,7 @@ class RegionViewerApp(tk.Tk):
             filetypes=[("JSON", "*.json")])
         if not path:
             return
-        with open(path, 'w') as f:
-            json.dump({"sections": sections}, f, indent=2)
+        write_sections_json(sections, path)
         messagebox.showinfo(
             "Export sections.json",
             f"Wrote {len(sections)} drivable sections to {path}\n"

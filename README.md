@@ -13,6 +13,12 @@ Run each script from the repo root, for example:
 Most scanners accept `--help`. Each script has a docstring with the layout it reads.
 `tools.md` has one line for every tool. `tool_gaps.md` lists what each tool does not read.
 
+## Folder rule
+
+Topic folders (`common/`, `scenery/`, `flares/`, `region/`, ...) read game files and write
+middleman files (JSON, TSV, CSV) to `outputs/<tool-name>/`. `beamng/` holds tools that read
+those middleman files and write BeamNG formats. Tools in `beamng/` never read game files.
+
 this should be removed soon because the goal is to remove any gaps and catch all data.
 New shared modules go in `common/`.
 

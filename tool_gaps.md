@@ -77,7 +77,10 @@ bias level, flags, rendering order, mipmap bias. (The C# reader keeps these; see
 - The 0x30 block of each 0x50-byte WorldFXTrigger record is decoded: a 3x3 rotation matrix, position in row 3. The C# export writes the rotation columns. No gap.
 - **extract_emitters.py** Does not read the stream file. It needs `fx_triggers.tsv` from the C# AssetDumper command and Attribulator yml files.
   Hash-only texture names stay unresolved unless you give it the texture folder.
-- **build_beamng_particles.py** Skips layers with emission rate 0 and linked layers. Applies only the Z part of Accel (it counts the horizontal part as ignored).
+
+## beamng/
+
+- **particles/build_beamng_particles.py** Skips layers with emission rate 0 and linked layers. Applies only the Z part of Accel (it counts the horizontal part as ignored).
 
 ## triggers/
 
