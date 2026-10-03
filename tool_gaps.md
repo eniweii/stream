@@ -44,7 +44,6 @@ this list. Byte ranges are offsets inside one record.
 - Skips section 2600 unless `--include-2600` is set.
 - Reads only 0x50-byte markers. The 44 chunks at size 92 are not explained (roadmap).
 
-**flare_marker_scan.py** Discovery accepts only 0x50 records with a 0, 4, or 8-byte prefix. Other record sizes are not found.
 **flare_scan.py** Reads the layout in its docstring (pack 0x60, instance 0x30). The instance flags byte (+0x2D) is printed raw, not decoded.
 **flare_report.py**, **find_flare_hashes.py** Work from the Carbon exe and the vault yml. They do not read the stream file.
 
@@ -60,8 +59,10 @@ this list. Byte ranges are offsets inside one record.
 - Frame hashes are not resolved to texture names.
 - (doc) The docstring says to point it at a .TPK, not the stream file. The roadmap says the chunks are in STREAML5RA.BUN. Check which is right.
 
-**uv_scroll_dump.py** Reads 11 fields of the 88-byte TextureStruct (0x33310004): hash, size, tilable UV,
-scroll type, timestep, speeds, offset, scale. Not read: alpha blend type, alpha usage type, alpha sort,
+**uv_scroll_dump.py** Scroll and snap data is not dropped: it reads scroll type (including snap), timestep, speed S/T,
+offset S/T, and scale S/T, and writes the raw values. The divisors that turn them into UV units are not confirmed (doc).
+`texture_anim_scan.py` is frame-swap only and never touches scroll data. Reads 11 fields of the 88-byte TextureStruct (0x33310004): hash, size, tilable UV,
+scroll type, timestep, speeds, offset, scale. Fields it does not read (none are scroll data): alpha blend type, alpha usage type, alpha sort,
 bias level, flags, rendering order, mipmap bias. (The C# reader keeps these; see the audit.)
 
 ## world_anim/ (parser closed, playback open)
@@ -69,12 +70,11 @@ bias level, flags, rendering order, mipmap bias. (The C# reader keeps these; see
 - (doc) `unknown_0x6e` is unconfirmed. The raw flags byte (+0x4A) bits 0x08, 0x10, 0x20 are printed but not confirmed.
 - (doc) Open for playback: oscillation formula, delay source, timescale byte.
 - (doc) Library and parent anim borrowing (`use_library_anim`, `use_parent_anim`) is only bucketed and counted. Nothing resolves the borrow.
-- **parse_2400_anims.py** uses a field table that `dump_worldanim_2400.py` calls wrong. Use `dump_worldanim_2400.py`.
 - **parse_2600_anims.py** pairs a frames chunk with its rtnode only when the frames chunk comes right after. Other cases print a warning.
 
 ## emitters/
 
-- **dump_fx_trigger_matrices.py** The 0x30 block of each 0x50-byte WorldFXTrigger record is still undecoded. The tool only tests it as a rotation matrix.
+- The 0x30 block of each 0x50-byte WorldFXTrigger record is decoded: a 3x3 rotation matrix, position in row 3. The C# export writes the rotation columns. No gap.
 - **extract_emitters.py** Does not read the stream file. It needs `fx_triggers.tsv` from the C# AssetDumper command and Attribulator yml files.
   Hash-only texture names stay unresolved unless you give it the texture folder.
 - **build_beamng_particles.py** Skips layers with emission rate 0 and linked layers. Applies only the Z part of Accel (it counts the horizontal part as ignored).
@@ -85,7 +85,7 @@ bias level, flags, rendering order, mipmap bias. (The C# reader keeps these; see
 
 ## region/ (out of scope for the stream roadmap)
 
-- **nfs_trackpath.py**, **track_path_zone_reader.py** Zone `user_data` is a runtime pointer, kept raw. `data[4]` is kept raw. Barriers are fully read.
+- **nfs_trackpath.py** Zone `user_data` is a runtime pointer, kept raw. `data[4]` is kept raw. Barriers are fully read.
 - **nfs_carp_parser.py** (doc) Container offsets are confirmed on a ProStreet file. Field values are not checked.
 - **nfs_region_undercover.py** (doc) Ported from UCGT. Not checked on a real Undercover file.
 - **nfs_region_mw.py** (doc) Derived from decompiled source. Not hex-verified.
@@ -104,5 +104,14 @@ bias level, flags, rendering order, mipmap bias. (The C# reader keeps these; see
 | T1.4 Materials | Shading group bytes +0x1E..+0x2F and others unread; texture list second u32 dropped |
 | T1.5 SolidMarkers | One LOD only; 44 size-92 chunks open; flags and groups not applied |
 | T1.7 Texture anim | Scanner only: no structured output, frame entry bytes 4-11 and inst/pack containers unread |
-| T2 emitters | 0x30 block undecoded |
 | T2 unread chunks | 0x34105, 0x34107, 0x3410D, 0x135002, 0x3B801/2, unknown IDs have no tool yet |
+
+## Removed as superseded (2026-10-03)
+
+| Removed | Replaced by |
+|---|---|
+| `world_anim/parse_2400_anims.py` | `world_anim/dump_worldanim_2400.py` (confirmed rt_node layout; the old field table merged fields wrongly) |
+| `world_anim/rtnode_section_scanner.py` | `world_anim/dump_worldanim_allsections.py` (same confirmed layout, all sections) |
+| `region/track_path_zone_reader.py` | `region/nfs_trackpath.py` (same layout, used by the viewer) |
+| `emitters/dump_fx_trigger_matrices.py` | Decoded: 0x30 block is a rotation matrix, exported by the C# fx-triggers command |
+| `flares/flare_marker_scan.py` | `flares/flare_scenery_scan.py` (marker chunk 0x13401A confirmed). For the 44 size-92 chunks use `common/chunk_probe.py --size 92` |

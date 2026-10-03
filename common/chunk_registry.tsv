@@ -35,7 +35,7 @@ chunk_id	name	file	status	tool	roadmap	note
 0x00037250	world_anim rtnode	stream	partial	world_anim/dump_worldanim_2400.py	closed	playback items open
 0x00037260	world_anim counts	stream	done	world_anim/world_anim_scan.py	closed	-
 0x00037270	world_anim endptr	stream	done	world_anim/world_anim_scan.py	closed	-
-0x0003BC00	EmitterLibrary / WorldFXTrigger (0x50 each)	stream	partial	emitters/dump_fx_trigger_matrices.py	T2	0x30 block undecoded
+0x0003BC00	EmitterLibrary / WorldFXTrigger (0x50 each)	stream	done	emitters/extract_emitters.py	T2	0x30 block = 3x3 rotation matrix (position is row 3); read by the C# fx-triggers export
 0x80036000	EventTriggerPack (container)	stream	set-aside	triggers/world_event_trigger_scan.py	T2	ambient audio triggers
 0x00036001	EventTrigger header	stream	set-aside	triggers/world_event_trigger_scan.py	T2	-
 0x00036002	EventTrigger AABB tree	stream	set-aside	triggers/world_event_trigger_scan.py	T2	leaves sampled only

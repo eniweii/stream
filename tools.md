@@ -27,7 +27,6 @@ Path | Purpose
 `solids_materials/carbon_material_viewer.py` | GUI viewer for `carbon_material_dictionary.json`
 **flares/** |
 `flares/flare_scan.py` | Flare packs (flare::pack, flare::instance)
-`flares/flare_marker_scan.py` | position_marker records inside solids
 `flares/flare_scenery_scan.py` | World positions of all scenery flares
 `flares/flare_report.py` | Join flare TSV with vault `light_flares_cg.yml`
 `flares/find_flare_hashes.py` | Find flare type table in the Carbon exe
@@ -36,8 +35,6 @@ Path | Purpose
 `texture_anim/uv_scroll_dump.py` | Dump UV scroll values per texture
 **world_anim/** |
 `world_anim/world_anim_scan.py` | Brute-force scan of the world_anim chunk family
-`world_anim/rtnode_section_scanner.py` | rtnode chunks, sections 2400 and 2600
-`world_anim/parse_2400_anims.py` | Section 2400 rtnode parser (older field table)
 `world_anim/parse_2600_anims.py` | Section 2600 rtnode and frames parser
 `world_anim/dump_worldanim_2400.py` | Section 2400 diagnostic dump (confirmed struct)
 `world_anim/dump_worldanim_allsections.py` | Whole-stream rtnode diagnostic by library/parent flags
@@ -45,7 +42,6 @@ Path | Purpose
 **emitters/** |
 `emitters/extract_emitters.py` | Step 1: resolve emitters from Attribulator yml and `fx_triggers.tsv`
 `emitters/build_beamng_particles.py` | Step 3: write BeamNG particle JSON
-`emitters/dump_fx_trigger_matrices.py` | Test the 0x30 block of WorldFXTrigger records
 **triggers/** |
 `triggers/world_event_trigger_scan.py` | Scanner for 0x80036000 event triggers
 **region/** (region file, out of scope) |
@@ -54,7 +50,6 @@ Path | Purpose
 `region/diagnose_relations.py` | Check unk1/dataCount in ChunksRelated
 `region/nfs_carp_parser.py` | CARP world grid and road network
 `region/nfs_trackpath.py` | TrackPath zones and barriers
-`region/track_path_zone_reader.py` | Standalone TrackPath scanner
 **viewers/** |
 `viewers/nfs_region_viewer.py` | Tkinter viewer: boundaries and relations
 `viewers/nfs_3d_viewer.py` | 3D viewer with camera-based streaming
