@@ -5,7 +5,7 @@ extract_emitters.py - Step 1 of the Carbon -> BeamNG emitter port.
 Reads (all from ONE folder you pick):
   emitterdata.yml    Attribulator unpack output (emitter layers)
   emittergroup.yml   Attribulator unpack output (groups of layers)
-  fx_triggers.tsv    output of the AssetDumper scan-fx-triggers command
+  fx_triggers.tsv    output of emitters/fx_trigger_scan.py (run it on the stream file)
                      (if it is not in the folder, a file dialog asks for it)
 
 Writes, into the same folder:

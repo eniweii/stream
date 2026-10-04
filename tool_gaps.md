@@ -14,7 +14,9 @@ this list. Byte ranges are offsets inside one record.
 - SceneryInstance 0x34103 (0x60 bytes): reads flags, position, rotation, guid, info index.
   Not read: +0x00..+0x0B, +0x10..+0x1F, +0x56..+0x5F.
 - Other chunks inside a 0x80034100 section are skipped: 0x34105 tree nodes, 0x34107 preculler, 0x3410D.
-- Override infos (0x34108) and groups (0x34109): every field is read. No gap.
+- Override infos (0x34108) and groups (0x34109): every field is read. No gap. They are in the REGION file, so load both files (the command line takes both).
+- Group padding rule: tries always-advance first, then pad-only-if-unaligned, and keeps the one that ends exactly on the chunk end. Prints a warning when neither fits.
+- Command line TSV export (`scenery_groups.tsv`, `scenery_overrides.tsv`, `--instances` join): tested on synthetic files only.
 - (doc) Not run against a real file.
 
 **nfs_scenery_dae_scan.py** (doc) Not verified against a real exported .dae.
@@ -76,9 +78,16 @@ bias level, flags, rendering order, mipmap bias. (The C# reader keeps these; see
 
 ## emitters/
 
-- The 0x30 block of each 0x50-byte WorldFXTrigger record is decoded: a 3x3 rotation matrix, position in row 3. The C# export writes the rotation columns. No gap.
-- **extract_emitters.py** Does not read the stream file. It needs `fx_triggers.tsv` from the C# AssetDumper command and Attribulator yml files.
+- The 0x30 block of each 0x50-byte WorldFXTrigger record is decoded: matrix rows 0-2 (4 floats per row, the 4th is pad), position in row 3. `fx_trigger_scan.py` writes the rotation columns. No gap. The AssetDumper `scan-fx-triggers` command is removed.
+- `fx_trigger_scan.py` is tested on synthetic files only. The name table is MW's (143 names), so Carbon effects not in it print as UNKNOWN_0x........ (extract_emitters.py resolves them from the yml).
+- **extract_emitters.py** Does not read the stream file. It needs `fx_triggers.tsv` from `emitters/fx_trigger_scan.py` and Attribulator yml files.
   Hash-only texture names stay unresolved unless you give it the texture folder.
+
+## lights/
+
+- `light_pack_scan.py` keeps every field of the 0x60 light record. The AssetDumper reader dropped type, attenuation_type, shape, state, exclude_name_hash, direction and the per-light section number; they are in `lights.tsv` now. `falloff` is exported raw (the C# reader copied far_end into it).
+- Light AABB (0x135002) is still unread.
+- Tested on synthetic files only. The AssetDumper `--export-lights` option still exists; nothing in the stream repo turns `lights.tsv` into BeamNG lights yet (the flare pipeline does it for flares, `beamng/flares/flare_lights_beamng.py`).
 
 ## beamng/
 
@@ -118,5 +127,5 @@ bias level, flags, rendering order, mipmap bias. (The C# reader keeps these; see
 | `world_anim/parse_2400_anims.py` | `world_anim/dump_worldanim_2400.py` (confirmed rt_node layout; the old field table merged fields wrongly) |
 | `world_anim/rtnode_section_scanner.py` | `world_anim/dump_worldanim_allsections.py` (same confirmed layout, all sections) |
 | `region/track_path_zone_reader.py` | `region/nfs_trackpath.py` (same layout, used by the viewer) |
-| `emitters/dump_fx_trigger_matrices.py` | Decoded: 0x30 block is a rotation matrix, exported by the C# fx-triggers command |
+| `emitters/dump_fx_trigger_matrices.py` | Decoded: 0x30 block is a rotation matrix, exported by `emitters/fx_trigger_scan.py` (formerly the C# fx-triggers command) |
 | `flares/flare_marker_scan.py` | `flares/flare_scenery_scan.py` (marker chunk 0x13401A confirmed). For the 44 size-92 chunks use `common/chunk_probe.py --size 92` |

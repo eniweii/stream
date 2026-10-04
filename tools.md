@@ -16,7 +16,7 @@ Path | Purpose
 `common/chunk_registry.py` | Compare a file's chunk IDs with `chunk_registry.tsv` (unregistered, label mismatch, not found)
 `common/chunk_probe.py` | Inspect one chunk ID: sizes, stride guess, per-column table, hex records
 **scenery/** |
-`scenery/nfs_stream_scenery.py` | Reader: scenery instances, override groups (0x34108/9)
+`scenery/nfs_stream_scenery.py` | Reader: scenery instances (stream file), override groups 0x34108/9 (region file). Command line writes `scenery_groups.tsv`, `scenery_overrides.tsv`, and with `--instances` adds Groups columns to AssetDumper's `scenery_instances.tsv`
 `scenery/nfs_scenery_dae_scan.py` | Read per-section DAE nodes (identity and transform)
 `scenery/nfs_scn_ref_match.py` | Match section DAEs to a Blender position dump
 `scenery/nfs_scn_ref_report.py` | CSV: DAE-Blender identity, group membership, SceneryGuid
@@ -40,7 +40,10 @@ Path | Purpose
 `world_anim/dump_worldanim_allsections.py` | Whole-stream rtnode diagnostic by library/parent flags
 `world_anim/nfs_anim_name_match.py` | Match instance names to rtnode data
 **emitters/** |
+`emitters/fx_trigger_scan.py` | Self-contained: emitter trigger positions and rotations from the stream file (0x3BC00) to `fx_triggers.tsv`
 `emitters/extract_emitters.py` | Step 1: resolve emitters from Attribulator yml and `fx_triggers.tsv`
+**lights/** |
+`lights/light_pack_scan.py` | Self-contained: every light pack light (0x80135000) from the stream file to `lights.tsv`, with all fields incl. direction, type, state
 **triggers/** |
 `triggers/world_event_trigger_scan.py` | Scanner for 0x80036000 event triggers
 **region/** (region file, out of scope) |
@@ -52,7 +55,6 @@ Path | Purpose
 `region/export_sections.py` | Write `sections.json` (drivable boundaries + related IDs) from a region and a stream file. The viewer button uses it
 **viewers/** |
 `viewers/nfs_region_viewer.py` | Tkinter viewer: boundaries and relations
-`viewers/nfs_3d_viewer.py` | 3D viewer with camera-based streaming
 **beamng/** (reads middleman files, writes BeamNG formats) |
 `beamng/particles/build_beamng_particles.py` | Step 3: `emitters_resolved.json` to BeamNG particle JSON
 `beamng/flares/flare_lights_beamng.py` | Flare TSV to BeamNG PointLights (`items.level.json`), with `sectionID` and `sectionOverrideName`

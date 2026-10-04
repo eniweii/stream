@@ -19,6 +19,24 @@ Carbon/World09 only for now - SceneryInstanceInternal's 0x60-byte layout is
 specific to those two games; other games have different struct shapes on
 the C# side and would need their own version of _parse_scenery_instances.
 
+WHERE THE DATA LIVES: the instances (0x80034100) are in the stream file. The
+named override groups (0x34108 override infos, 0x34109 groups) are in the
+REGION file (L5RA.BUN), which AssetDumper does not read. Load both and
+merge() them (the command line below does it).
+
+Command line - writes the scenery middleman files AssetDumper cannot write:
+    python scenery/nfs_stream_scenery.py STREAML5RA.BUN L5RA.BUN
+    python scenery/nfs_stream_scenery.py STREAML5RA.BUN L5RA.BUN \
+        --instances E:/adexports/c/sections/scenery_instances.tsv
+Files go to outputs/nfs_stream_scenery/ (or --out DIR):
+    scenery_groups.tsv     one row per group (key, name, barrier flags, ...)
+    scenery_overrides.tsv  one row per group and override (section, instance, flags)
+    scenery_instances.tsv  only with --instances: AssetDumper's file plus the
+                           Groups (hex keys) and GroupNames columns, joined on
+                           Section + Instance
+Checks are printed at the end (override indices outside the table, overrides
+for sections or instances that do not exist in the loaded stream data).
+
 NOT yet run against a real file - same caveat as everything else in this
 project that hasn't been hex-verified yet. In particular: whether
 scenery_override_infos/scenery_groups are really top-level siblings of the
@@ -31,6 +49,8 @@ them either way without needing to know which.
 import pathlib as _pl, sys as _sys
 _sys.path[:0] = [str(_pl.Path(__file__).resolve().parents[1] / _d) for _d in ['common', 'region', 'scenery', 'solids_materials']]
 
+import argparse
+import csv
 import struct
 
 from nfs_region_common import walk_chunks
@@ -251,38 +271,72 @@ def _parse_groups(data, payload_start, length):
     Common/Scenery/SceneryGroupReader.cs for the full layout reasoning
     (intrusive linked-list pointers, the always-advance alignment quirk) -
     this is a direct port of that logic."""
-    groups = []
-    pos = payload_start
     end = payload_start + length
 
-    while pos < end:
-        pos += 8  # next_/prev_, meaningless on disk
+    groups, final_pos = _parse_groups_with_padding(data, payload_start, end, True)
+    if final_pos == end:
+        return groups
 
-        key = struct.unpack_from('<I', data, pos)[0]
-        pos += 4
-        group_number, override_count = struct.unpack_from('<HH', data, pos)
-        pos += 4
-        barrier_flag, drive_through_barrier_flag = struct.unpack_from('<BB', data, pos)
-        pos += 2
-        race_specific_section_number = struct.unpack_from('<H', data, pos)[0]
-        pos += 2
+    # The always-advance rule did not land exactly on the chunk end. Try the
+    # other rule (pad only when not already aligned), the same fallback
+    # flare_scenery_scan.py uses, and keep whichever one fits.
+    other_groups, other_pos = _parse_groups_with_padding(data, payload_start, end, False)
+    if other_pos == end:
+        print("[nfs_stream_scenery] group chunk fits only with the 'pad only if unaligned' rule, using it")
+        return other_groups
 
-        override_indices = [
-            struct.unpack_from('<H', data, pos + 2 * i)[0]
-            for i in range(override_count)
-        ]
-        pos += override_count * 2
+    print(f"[nfs_stream_scenery] WARNING: group chunk padding rule unclear (always-advance ends at "
+          f"{final_pos}, other rule at {other_pos}, chunk ends at {end}); using always-advance")
+    return groups
 
-        groups.append(SceneryGroup(
-            key, group_number, barrier_flag, drive_through_barrier_flag,
-            race_specific_section_number, override_indices,
-        ))
 
-        # Always advance to the NEXT multiple of 4, even if already aligned -
-        # matches the real loader exactly (see SceneryGroupReader.cs).
+def _parse_groups_with_padding(data, payload_start, end, always_advance):
+    """One pass over the group records. Returns (groups, final_pos). final_pos
+    is -1 when the data ran out (wrong rule, so the next record was garbage)."""
+    groups = []
+    pos = payload_start
+
+    try:
+        while pos < end:
+            pos = _read_one_group(data, pos, groups, always_advance)
+    except struct.error:
+        return groups, -1
+
+    return groups, pos
+
+
+def _read_one_group(data, pos, groups, always_advance):
+    """Reads the group record at pos, appends it to groups, returns the
+    position of the next record."""
+    pos += 8  # next_/prev_, meaningless on disk
+
+    key = struct.unpack_from('<I', data, pos)[0]
+    pos += 4
+    group_number, override_count = struct.unpack_from('<HH', data, pos)
+    pos += 4
+    barrier_flag, drive_through_barrier_flag = struct.unpack_from('<BB', data, pos)
+    pos += 2
+    race_specific_section_number = struct.unpack_from('<H', data, pos)[0]
+    pos += 2
+
+    override_indices = [
+        struct.unpack_from('<H', data, pos + 2 * i)[0]
+        for i in range(override_count)
+    ]
+    pos += override_count * 2
+
+    groups.append(SceneryGroup(
+        key, group_number, barrier_flag, drive_through_barrier_flag,
+        race_specific_section_number, override_indices,
+    ))
+
+    # Always advance to the NEXT multiple of 4, even if already aligned -
+    # matches the real loader exactly (see SceneryGroupReader.cs). The
+    # other rule is only used when this one does not fit the chunk.
+    if always_advance or pos % 4 != 0:
         pos += 4 - (pos % 4)
 
-    return groups
+    return pos
 
 
 class StreamScenery:
@@ -390,3 +444,135 @@ def load_stream_scenery(path):
     result = StreamScenery(sections, overrides, groups)
     print(f"[nfs_stream_scenery] {result.summary()}")
     return result
+
+
+# ---------------------------------------------------------------------------
+# TSV export. AssetDumper writes scenery_infos.tsv and scenery_instances.tsv
+# from the stream file. The override groups are in the region file, which
+# AssetDumper does not read, so they are written here and joined to
+# AssetDumper's scenery_instances.tsv on Section + Instance (Instance is the
+# real on-disk instance number, the same number as in the DAE node id).
+# ---------------------------------------------------------------------------
+
+TOOL_NAME = 'nfs_stream_scenery'
+
+
+def _hex(value):
+    return f"0x{value:08X}"
+
+
+def _write_tsv(path, header, rows):
+    with open(path, 'w', encoding='utf-8', newline='') as f:
+        writer = csv.writer(f, delimiter='\t', lineterminator='\n')
+        writer.writerow(header)
+        writer.writerows(rows)
+
+
+def write_groups_tsv(scenery, path):
+    """One row per group. Name is empty when the key is not in the dictionary."""
+    rows = [
+        (_hex(g.key), g.name or '', g.group_number, g.barrier_flag, g.drive_through_barrier_flag,
+         g.race_specific_section_number, len(g.override_indices))
+        for g in scenery.groups
+    ]
+    _write_tsv(path, ['Key', 'Name', 'GroupNumber', 'BarrierFlag', 'DriveThroughBarrierFlag',
+                      'RaceSpecificSection', 'OverrideCount'], rows)
+
+
+def write_overrides_tsv(scenery, path):
+    """One row per group and override. FlagNames is the new live flag state the
+    override sets (low 16 bits of the instance flags), names joined with '|'."""
+    rows = []
+    for g in scenery.groups:
+        for idx in g.override_indices:
+            if idx >= len(scenery.overrides):
+                continue  # counted by check_scenery()
+            ov = scenery.overrides[idx]
+            rows.append((_hex(g.key), g.name or '', idx, ov.section_number, ov.instance_number,
+                         f"0x{ov.instance_flags:04X}", '|'.join(decode_instance_flags(ov.instance_flags))))
+    _write_tsv(path, ['GroupKey', 'GroupName', 'OverrideIndex', 'Section', 'Instance', 'Flags', 'FlagNames'], rows)
+
+
+def write_instances_with_groups(scenery, instances_tsv, path):
+    """AssetDumper's scenery_instances.tsv plus Groups (hex keys, '|' joined)
+    and GroupNames (name, or the hex key when unknown). Returns the number of
+    instances that belong to at least one group."""
+    with open(instances_tsv, 'r', encoding='utf-8', newline='') as f:
+        reader = csv.DictReader(f, delimiter='\t')
+        fieldnames = [n for n in reader.fieldnames if n not in ('Groups', 'GroupNames')]
+        rows = list(reader)
+
+    with_groups = 0
+    out_rows = []
+    for row in rows:
+        hits = scenery.groups_for(int(row['Section']), int(row['Instance']))
+        if hits:
+            with_groups += 1
+        out = [row[n] for n in fieldnames]
+        out.append('|'.join(_hex(g.key) for g in hits))
+        out.append('|'.join(g.name or _hex(g.key) for g in hits))
+        out_rows.append(out)
+
+    _write_tsv(path, fieldnames + ['Groups', 'GroupNames'], out_rows)
+    return with_groups
+
+
+def check_scenery(scenery):
+    """Prints the sanity checks. A wrong read (for example the group padding
+    rule) shows up as indices that point nowhere."""
+    bad_index = 0
+    no_section = 0
+    past_end = 0
+    for g in scenery.groups:
+        for idx in g.override_indices:
+            if idx >= len(scenery.overrides):
+                bad_index += 1
+                continue
+            ov = scenery.overrides[idx]
+            section = scenery.sections.get(ov.section_number)
+            if section is None:
+                no_section += 1
+            elif ov.instance_number >= len(section.instances):
+                past_end += 1
+
+    in_group = {idx for g in scenery.groups for idx in g.override_indices}
+    no_group = sum(1 for idx in range(len(scenery.overrides)) if idx not in in_group)
+
+    print(f"[nfs_stream_scenery] check: {bad_index} group override index(es) outside the override table")
+    print(f"[nfs_stream_scenery] check: {no_section} override(s) point to a section with no stream instances loaded")
+    print(f"[nfs_stream_scenery] check: {past_end} override(s) point past the last instance of their section")
+    print(f"[nfs_stream_scenery] check: {no_group} override record(s) belong to no group")
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Write the scenery group TSV files (see the module docstring).")
+    ap.add_argument('stream_bun', help="stream file (STREAML5RA.BUN): the scenery instances")
+    ap.add_argument('region_bun', nargs='?', help="region file (L5RA.BUN): the override groups")
+    ap.add_argument('--instances', help="AssetDumper's scenery_instances.tsv, to add the Groups columns")
+    ap.add_argument('--out', help="output folder (default outputs/nfs_stream_scenery/)")
+    args = ap.parse_args(argv)
+
+    from pathlib import Path
+    from nfs_outputs import out_dir
+
+    scenery = load_stream_scenery(args.stream_bun)
+    if args.region_bun:
+        scenery.merge(load_stream_scenery(args.region_bun))
+    print(f"[nfs_stream_scenery] total: {scenery.summary()}")
+
+    out = Path(args.out) if args.out else out_dir(TOOL_NAME)
+    out.mkdir(parents=True, exist_ok=True)
+
+    write_groups_tsv(scenery, out / 'scenery_groups.tsv')
+    write_overrides_tsv(scenery, out / 'scenery_overrides.tsv')
+    print(f"[nfs_stream_scenery] wrote scenery_groups.tsv and scenery_overrides.tsv to {out}")
+
+    if args.instances:
+        with_groups = write_instances_with_groups(scenery, args.instances, out / 'scenery_instances.tsv')
+        print(f"[nfs_stream_scenery] wrote scenery_instances.tsv, {with_groups} instance(s) belong to a group")
+
+    check_scenery(scenery)
+
+
+if __name__ == '__main__':
+    main()

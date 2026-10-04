@@ -63,8 +63,8 @@ def generate_beamng_lights():
             # Light properties
             is_lamppost = type_name.lower() == "lamppost"
             cast_shadows = True if is_lamppost else False
-            radius = 40.0 if is_lamppost else 0.25
-            intensity = 25000 if is_lamppost else 5000
+            radius = 40.0 if is_lamppost else 1.0
+            intensity = 25000 if is_lamppost else 25000
 
             # Count occurrences of this (section, instance)
             instance_occurrence[(section, instance)] += 1

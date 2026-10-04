@@ -9,8 +9,8 @@ chunk_id	name	file	status	tool	roadmap	note
 0x00034103	SceneryInstance array (0x60 each)	stream	partial	scenery/nfs_stream_scenery.py	T1.2	flags, position, rotation, guid, info index read
 0x00034105	Scenery tree nodes	stream	unread		T2	completeness tier
 0x00034107	Scenery preculler	stream	unread		T2	keep raw bytes
-0x00034108	Scenery override infos (6 bytes each)	stream	done	scenery/nfs_stream_scenery.py	T1.3	-
-0x00034109	Scenery groups	stream	done	scenery/nfs_stream_scenery.py	T1.3	-
+0x00034108	Scenery override infos (6 bytes each)	region	done	scenery/nfs_stream_scenery.py	T1.3	in the region file (L5RA.BUN); AssetDumper does not read it
+0x00034109	Scenery groups	region	done	scenery/nfs_stream_scenery.py	T1.3	in the region file (L5RA.BUN); AssetDumper does not read it
 0x0003410D	Light texture collections	stream	unread		T2	-
 0x80134000	ObjectPack (container)	stream	partial	solids_materials/nfs_solid_reader.py	T1.4	-
 0x80134010	Solid object (container)	stream	done	solids_materials/nfs_solid_reader.py	T1.4	-
@@ -23,6 +23,9 @@ chunk_id	name	file	status	tool	roadmap	note
 0x00134B02	Plat mesh entries (shading groups, 144 bytes)	stream	partial	solids_materials/nfs_solid_reader.py	T1.4	see tool_gaps.md
 0x00134B03	Plat indices	stream	done	solids_materials/nfs_solid_reader.py	T1.4	-
 0x00134C02	Plat mesh entry name	stream	done	solids_materials/nfs_solid_reader.py	T1.4	-
+0x80135000	Light pack container (one per section)	stream	done	lights/light_pack_scan.py	T1.6	port of the C# LightPackReader; children 0x135001 / 0x135003
+0x00135001	Light pack header (0x20)	stream	done	lights/light_pack_scan.py	T1.6	version, section number, light count
+0x00135003	Light list (0x60 each)	stream	done	lights/light_pack_scan.py	T1.6	all fields kept, incl. type/attenuation/shape/state/direction the C# reader dropped
 0x00135002	Light AABB	stream	unread		T2	-
 0x00135200	Flare pack (flare::pack + flare::instance)	stream	scan-only	flares/flare_scan.py	T1.5	ID found by discovery mode
 0x33310004	TextureStruct array (0x58 each)	stream	partial	texture_anim/uv_scroll_dump.py	T1.7	UV scroll fields only
@@ -35,7 +38,7 @@ chunk_id	name	file	status	tool	roadmap	note
 0x00037250	world_anim rtnode	stream	partial	world_anim/dump_worldanim_2400.py	closed	playback items open
 0x00037260	world_anim counts	stream	done	world_anim/world_anim_scan.py	closed	-
 0x00037270	world_anim endptr	stream	done	world_anim/world_anim_scan.py	closed	-
-0x0003BC00	EmitterLibrary / WorldFXTrigger (0x50 each)	stream	done	emitters/extract_emitters.py	T2	0x30 block = 3x3 rotation matrix (position is row 3); read by the C# fx-triggers export
+0x0003BC00	EmitterLibrary / WorldFXTrigger (0x50 each)	stream	done	emitters/fx_trigger_scan.py	T2	0x30 block = matrix rows 0-2 (4 floats per row), position is row 3; read by emitters/fx_trigger_scan.py, used by extract_emitters.py
 0x80036000	EventTriggerPack (container)	stream	set-aside	triggers/world_event_trigger_scan.py	T2	ambient audio triggers
 0x00036001	EventTrigger header	stream	set-aside	triggers/world_event_trigger_scan.py	T2	-
 0x00036002	EventTrigger AABB tree	stream	set-aside	triggers/world_event_trigger_scan.py	T2	leaves sampled only
