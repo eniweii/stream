@@ -16,7 +16,7 @@ Path | Purpose
 `common/chunk_registry.py` | Compare a file's chunk IDs with `chunk_registry.tsv` (unregistered, label mismatch, not found)
 `common/chunk_probe.py` | Inspect one chunk ID: sizes, stride guess, per-column table, hex records
 **scenery/** |
-`scenery/nfs_stream_scenery.py` | Reader: scenery instances (stream file), override groups 0x34108/9 (region file). Command line writes `scenery_groups.tsv`, `scenery_overrides.tsv`, and with `--instances` adds Groups columns to AssetDumper's `scenery_instances.tsv`
+`scenery/nfs_stream_scenery.py` | Reader: scenery instances (stream file), override groups 0x34108/9 (region file). Command line writes `scenery_groups.tsv`, `scenery_overrides.tsv`, `scenery_infos.tsv` and `scenery_instances.tsv` (same columns as AssetDumper's files, so no AssetDumper run is needed; the region file adds Groups columns). With `--instances`, it joins the Groups columns to AssetDumper's file instead
 `scenery/nfs_scenery_dae_scan.py` | Read per-section DAE nodes (identity and transform)
 `scenery/nfs_scn_ref_match.py` | Match section DAEs to a Blender position dump
 `scenery/nfs_scn_ref_report.py` | CSV: DAE-Blender identity, group membership, SceneryGuid
@@ -52,9 +52,11 @@ Path | Purpose
 `region/diagnose_relations.py` | Check unk1/dataCount in ChunksRelated
 `region/nfs_carp_parser.py` | CARP world grid and road network
 `region/nfs_trackpath.py` | TrackPath zones and barriers
+`region/nfs_trough_boundary.py` | TroughBoundary.bin (separate file): named drivable polygons and holes. Writes `troughs.tsv` and `trough_points.tsv`. Run on the real Carbon file
+`region/nfs_collision_pack.py` | Collision packs of the stream file (chunk 0x3B801): collision instances. Writes `collision_instances.tsv`, and gives `HasCollision` to `nfs_stream_scenery.py --collision`. Layout from UCGT, checked on a synthetic file only
 `region/export_sections.py` | Write `sections.json` (drivable boundaries + related IDs) from a region and a stream file. The viewer button uses it
 **viewers/** |
-`viewers/nfs_region_viewer.py` | Tkinter viewer: boundaries and relations
+`viewers/nfs_region_viewer.py` | Tkinter viewer. File menu (open region, stream, trough; Game), Settings menu (road network rotation, default 270), Viewer and Export tabs. Four layers (Nodes, Sections, Zones, Troughs): show/hide each, one active mode with its own options row and click selection, and a layer draw order (Raise/Lower). Section info is split into collapsible categories. Export tab: sections.json (road node export planned). Tested under Xvfb with the real TroughBoundary.bin; not yet run on a real region file
 **beamng/** (reads middleman files, writes BeamNG formats) |
 `beamng/particles/build_beamng_particles.py` | Step 3: `emitters_resolved.json` to BeamNG particle JSON
 `beamng/flares/flare_lights_beamng.py` | Flare TSV to BeamNG PointLights (`items.level.json`), with `sectionID` and `sectionOverrideName`

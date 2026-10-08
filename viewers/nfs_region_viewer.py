@@ -1,18 +1,39 @@
 """
 Small Tkinter viewer for Black Box NFS region files, across games.
 
-Shows VisibleSections boundary polygons (yellow, or orange if they carry a
-non-zero elevationHash) labeled with their letter+number section ID (e.g.
-"A101"), and their adjacency relations (magenta lines between section
-centers) when the selected game's relations parser succeeds. Click a polygon
-to inspect its raw fields, including related-section labels.
+Layout:
+  File menu      Open region file, Open stream file, Open trough file, Clear
+                 stream data, Game (set it before you open a file), Exit
+  Settings menu  Road network rotation (0/90/180/270, default 270). It turns
+                 the road network nodes only; 270 is what lines them up with
+                 the boundaries
+  Viewer tab     four layers - Nodes (L5RA traffic nodes), Sections
+                 (VisibleSections boundaries and relations), Zones (TrackPath
+                 zones and barriers), Troughs (TroughBoundary.bin outlines).
+                 "Show" checkboxes turn any combination on. The "Mode" radio
+                 buttons pick the ACTIVE layer: it owns the options row below
+                 the mode bar and the click selection (a click only picks from
+                 the active layer). Layer order (right end of the options row)
+                 decides which layer is drawn on top: Raise / Lower move the
+                 active layer. Switching mode, layers or order never moves the
+                 viewport; only Fit to view and opening a region file do
+  Export tab     sections.json (needs the region file and a stream file).
+                 The road node export will come here
 
-Pick the game from the dropdown before opening a file - see
+Sections: yellow polygons (orange with a non-zero elevationHash) labeled with
+their letter+number section ID (e.g. "A101"), and their adjacency relations
+(magenta lines between section centers) when the selected game's relations
+parser succeeds. Click a polygon to inspect its raw fields. Troughs: drivable
+areas in green, holes in red.
+
+Group names come from hashes_main.txt through nfs_hash_dictionary.
+
+Pick the game in File > Game before opening a file - see
 nfs_region_parser.GAME_PARSERS for what's verified vs. still a hypothesis
 per game.
 
 Usage: python3 nfs_region_viewer.py [path/to/file.BUN] [game]
-(If no path is given, a file-open dialog appears. game defaults to prostreet.)
+(If no path is given, open one from the File menu. game defaults to None.)
 """
 # stream bootstrap: make the shared library folders importable
 import pathlib as _pl, sys as _sys
@@ -30,6 +51,7 @@ from nfs_region_common import section_letter as _default_section_letter
 from nfs_region_common import format_section_label as _default_format_section_label
 from nfs_region_common import section_subsection
 from nfs_trackpath import ZONE_TYPES, STREAMER_PREDICTION
+from nfs_trough_boundary import load_trough_boundary
 
 
 class RegionViewerApp(tk.Tk):
@@ -50,7 +72,15 @@ class RegionViewerApp(tk.Tk):
         self.show_labels = tk.BooleanVar(value=True)
         self.dim_nondrivable = tk.BooleanVar(value=False)
         self.game = tk.StringVar(value=game if game in GAME_PARSERS else 'None')
-        self.view_mode = tk.StringVar(value='boundaries')
+        self.active_mode = tk.StringVar(value='sections')   # which layer owns the options row and the clicks
+        self.layer_order = ['sections', 'troughs', 'zones', 'nodes']   # bottom to top: the last one is drawn on top
+        self.info_open = {}   # section info category -> open (True) or collapsed (False), kept between clicks
+        self.layer_vars = {                                  # which layers are drawn
+            'nodes': tk.BooleanVar(value=False),
+            'sections': tk.BooleanVar(value=True),
+            'zones': tk.BooleanVar(value=True),
+            'troughs': tk.BooleanVar(value=True),
+        }
         self.road_rotation = tk.StringVar(value='270')
         self.show_road_width = tk.BooleanVar(value=True)
         self.search_var = tk.StringVar()
@@ -66,10 +96,14 @@ class RegionViewerApp(tk.Tk):
         self.show_zones = tk.BooleanVar(value=True)
         self.show_barriers = tk.BooleanVar(value=True)
         self.show_zone_labels = tk.BooleanVar(value=True)
-        self.zone_select_mode = tk.BooleanVar(value=False)
         self.visible_zone_types = set(ZONE_TYPES)
         self.selected_zones = set()      # zone.offset values under the last click
         self.selected_barriers = set()   # barrier.offset values near the last click
+        self.troughs = None              # TroughBoundary from TroughBoundary.bin, or None
+        self.trough_path = None
+        self.show_trough_labels = tk.BooleanVar(value=False)
+        self.show_trough_holes = tk.BooleanVar(value=True)
+        self.selected_troughs = set()    # trough indices under the last click
 
         self._build_ui()
 
@@ -77,69 +111,126 @@ class RegionViewerApp(tk.Tk):
             self.load_file(path)
 
     # ---------- UI ----------
+    MODES = [('nodes', 'Nodes'), ('sections', 'Sections'), ('zones', 'Zones'), ('troughs', 'Troughs')]
+    MODE_TITLES = {'nodes': 'Node info', 'sections': 'Section info',
+                   'zones': 'Zone info', 'troughs': 'Trough info'}
+
     def _build_ui(self):
-        toolbar = tk.Frame(self)
-        toolbar.pack(side=tk.TOP, fill=tk.X)
+        self._build_menus()
 
-        tk.Button(toolbar, text="Open...", command=self.open_dialog).pack(side=tk.LEFT, padx=4, pady=4)
-        tk.Button(toolbar, text="Open stream file...", command=self.open_stream_dialog).pack(side=tk.LEFT, padx=4, pady=4)
-        tk.Button(toolbar, text="Clear stream data", command=self.clear_stream_data).pack(side=tk.LEFT, padx=4, pady=4)
-        tk.Button(toolbar, text="Groups...", command=self.open_group_view).pack(side=tk.LEFT, padx=4, pady=4)
-        tk.Button(toolbar, text="Export sections.json...", command=self.export_sections_json).pack(side=tk.LEFT, padx=4, pady=4)
-        tk.Button(toolbar, text="Fit to view", command=self.fit_to_view).pack(side=tk.LEFT, padx=4, pady=4)
+        self.tabs = ttk.Notebook(self)
+        self.tabs.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        viewer_tab = tk.Frame(self.tabs)
+        export_tab = tk.Frame(self.tabs)
+        self.tabs.add(viewer_tab, text="Viewer")
+        self.tabs.add(export_tab, text="Export")
 
-        tk.Label(toolbar, text="View:").pack(side=tk.LEFT, padx=(12, 2))
-        view_combo = ttk.Combobox(toolbar, textvariable=self.view_mode, state="readonly",
-                                   width=14, values=['boundaries', 'road network', 'combined'])
-        view_combo.pack(side=tk.LEFT, padx=(0, 8))
-        view_combo.bind("<<ComboboxSelected>>", lambda e: self.fit_to_view())
+        # Footer first, so the status lines keep their place at the bottom
+        footer = tk.Frame(self)
+        footer.pack(side=tk.BOTTOM, fill=tk.X)
+        self.status_label = tk.Label(footer, text="No file loaded", anchor="w")
+        self.status_label.pack(side=tk.TOP, fill=tk.X, padx=6, pady=(2, 0))
+        self.stream_status_label = tk.Label(footer, text="No stream file loaded", anchor="w", fg="#888")
+        self.stream_status_label.pack(side=tk.TOP, fill=tk.X, padx=6, pady=(0, 0))
+        self.trough_status_label = tk.Label(footer, text="No trough file loaded", anchor="w", fg="#888")
+        self.trough_status_label.pack(side=tk.TOP, fill=tk.X, padx=6, pady=(0, 2))
 
-        tk.Label(toolbar, text="Rotate:").pack(side=tk.LEFT, padx=(12, 2))
-        rotate_combo = ttk.Combobox(toolbar, textvariable=self.road_rotation, state="readonly",
-                                     width=4, values=['0', '90', '180', '270'])
-        rotate_combo.pack(side=tk.LEFT, padx=(0, 8))
-        rotate_combo.bind("<<ComboboxSelected>>", lambda e: self.fit_to_view())
+        self._build_viewer_tab(viewer_tab)
+        self._build_export_tab(export_tab)
+        self._on_mode_change()
 
-        tk.Label(toolbar, text="Game:").pack(side=tk.LEFT, padx=(12, 2))
-        game_combo = ttk.Combobox(toolbar, textvariable=self.game, state="readonly",
-                                   width=12, values=sorted(GAME_PARSERS.keys()))
-        game_combo.pack(side=tk.LEFT, padx=(0, 8))
-        game_combo.bind("<<ComboboxSelected>>", self._on_game_change)
+    def _build_menus(self):
+        menubar = tk.Menu(self, tearoff=False)
 
-        tk.Checkbutton(toolbar, text="Show relations", variable=self.show_relations,
+        file_menu = tk.Menu(menubar, tearoff=False)
+        file_menu.add_command(label="Open region file...", command=self.open_dialog)
+        file_menu.add_command(label="Open stream file...", command=self.open_stream_dialog)
+        file_menu.add_command(label="Open trough file...", command=self.open_trough_dialog)
+        file_menu.add_separator()
+        file_menu.add_command(label="Clear stream data", command=self.clear_stream_data)
+        file_menu.add_separator()
+        game_menu = tk.Menu(file_menu, tearoff=False)
+        for game_name in sorted(GAME_PARSERS.keys()):
+            game_menu.add_radiobutton(label=game_name, value=game_name, variable=self.game,
+                                       command=self._on_game_change)
+        file_menu.add_cascade(label="Game", menu=game_menu)
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self.destroy)
+        menubar.add_cascade(label="File", menu=file_menu)
+
+        settings_menu = tk.Menu(menubar, tearoff=False)
+        rotation_menu = tk.Menu(settings_menu, tearoff=False)
+        for degrees in ('0', '90', '180', '270'):
+            rotation_menu.add_radiobutton(label=degrees, value=degrees, variable=self.road_rotation,
+                                           command=self._on_rotation_change)
+        settings_menu.add_cascade(label="Road network rotation", menu=rotation_menu)
+        menubar.add_cascade(label="Settings", menu=settings_menu)
+
+        self.config(menu=menubar)
+
+    def _build_viewer_tab(self, parent):
+        # Mode bar: the active layer (radio buttons) and which layers are drawn (checkboxes)
+        modebar = tk.Frame(parent)
+        modebar.pack(side=tk.TOP, fill=tk.X)
+        tk.Label(modebar, text="Mode:").pack(side=tk.LEFT, padx=(6, 2), pady=4)
+        for key, label in self.MODES:
+            tk.Radiobutton(modebar, text=label, value=key, variable=self.active_mode,
+                            command=self._on_mode_change).pack(side=tk.LEFT, padx=2)
+        tk.Label(modebar, text="     Show:").pack(side=tk.LEFT, padx=(12, 2))
+        for key, label in self.MODES:
+            tk.Checkbutton(modebar, text=label, variable=self.layer_vars[key],
+                            command=self.redraw).pack(side=tk.LEFT, padx=2)
+        tk.Button(modebar, text="Fit to view", command=self.fit_to_view).pack(side=tk.RIGHT, padx=6, pady=2)
+
+        # Options row: one frame per mode, only the active one is packed
+        self.options_holder = tk.Frame(parent, relief=tk.GROOVE, borderwidth=1)
+        self.options_holder.pack(side=tk.TOP, fill=tk.X, padx=4, pady=(0, 2))
+        self.mode_options = {key: tk.Frame(self.options_holder) for key, _ in self.MODES}
+
+        order_frame = tk.Frame(self.options_holder)
+        order_frame.pack(side=tk.RIGHT)
+        self.order_label = tk.Label(order_frame, text="", fg="#555")
+        self.order_label.pack(side=tk.LEFT, padx=(0, 6))
+        tk.Label(order_frame, text="Layer order:").pack(side=tk.LEFT)
+        tk.Button(order_frame, text="Raise", command=lambda: self._move_layer(1)).pack(side=tk.LEFT, padx=(4, 2), pady=1)
+        tk.Button(order_frame, text="Lower", command=lambda: self._move_layer(-1)).pack(side=tk.LEFT, padx=(0, 6), pady=1)
+
+        nodes_row = self.mode_options['nodes']
+        tk.Checkbutton(nodes_row, text="Show road width", variable=self.show_road_width,
+                        command=self.redraw).pack(side=tk.LEFT, padx=8, pady=2)
+        self.rotation_label = tk.Label(nodes_row, text="", fg="#555")
+        self.rotation_label.pack(side=tk.LEFT, padx=8)
+
+        sections_row = self.mode_options['sections']
+        tk.Checkbutton(sections_row, text="Show relations", variable=self.show_relations,
+                        command=self.redraw).pack(side=tk.LEFT, padx=8, pady=2)
+        tk.Checkbutton(sections_row, text="Section labels", variable=self.show_labels,
                         command=self.redraw).pack(side=tk.LEFT, padx=8)
-        tk.Checkbutton(toolbar, text="Section labels", variable=self.show_labels,
+        tk.Checkbutton(sections_row, text="Dim non-drivable", variable=self.dim_nondrivable,
                         command=self.redraw).pack(side=tk.LEFT, padx=8)
-        tk.Checkbutton(toolbar, text="Dim non-drivable", variable=self.dim_nondrivable,
-                        command=self.redraw).pack(side=tk.LEFT, padx=8)
-        tk.Checkbutton(toolbar, text="Show road width", variable=self.show_road_width,
-                        command=self.redraw).pack(side=tk.LEFT, padx=8)
-        search_bar = tk.Frame(self)
-        search_bar.pack(side=tk.TOP, fill=tk.X)
-        tk.Label(search_bar, text="Search scenery names:").pack(side=tk.LEFT, padx=(4, 2), pady=2)
-        search_entry = tk.Entry(search_bar, textvariable=self.search_var, width=30)
+        tk.Label(sections_row, text="   Search scenery names:").pack(side=tk.LEFT, padx=(8, 2))
+        search_entry = tk.Entry(sections_row, textvariable=self.search_var, width=30)
         search_entry.pack(side=tk.LEFT, padx=(0, 4))
         search_entry.bind("<Return>", lambda e: self._search_scenery())
-        tk.Button(search_bar, text="Find", command=self._search_scenery).pack(side=tk.LEFT)
+        tk.Button(sections_row, text="Find", command=self._search_scenery).pack(side=tk.LEFT)
+        tk.Button(sections_row, text="Groups...", command=self.open_group_view).pack(side=tk.LEFT, padx=(12, 4))
 
-        tk.Label(search_bar, text="   Guess group name:").pack(side=tk.LEFT, padx=(8, 2))
-        self.group_guess_var = tk.StringVar()
-        guess_entry = tk.Entry(search_bar, textvariable=self.group_guess_var, width=24)
-        guess_entry.pack(side=tk.LEFT)
-        guess_entry.bind("<Return>", lambda e: self._guess_group_name())
-        tk.Button(search_bar, text="Test", command=self._guess_group_name).pack(side=tk.LEFT)
+        zones_row = self.mode_options['zones']
+        tk.Checkbutton(zones_row, text="Zone areas", variable=self.show_zones,
+                        command=self.redraw).pack(side=tk.LEFT, padx=8, pady=2)
+        tk.Checkbutton(zones_row, text="Zone labels", variable=self.show_zone_labels,
+                        command=self.redraw).pack(side=tk.LEFT, padx=8)
+        tk.Checkbutton(zones_row, text="Barriers", variable=self.show_barriers,
+                        command=self.redraw).pack(side=tk.LEFT, padx=8)
+        tk.Button(zones_row, text="Zone types...", command=self.open_zone_types_dialog).pack(side=tk.LEFT, padx=8)
 
-        tk.Checkbutton(search_bar, text="Zones", variable=self.show_zones,
-                        command=self.redraw).pack(side=tk.LEFT, padx=(16, 2))
-        tk.Checkbutton(search_bar, text="Zone labels", variable=self.show_zone_labels,
-                        command=self.redraw).pack(side=tk.LEFT, padx=2)
-        tk.Checkbutton(search_bar, text="Barriers", variable=self.show_barriers,
-                        command=self.redraw).pack(side=tk.LEFT, padx=2)
-        tk.Checkbutton(search_bar, text="Zone select mode", variable=self.zone_select_mode,
-                        command=self._on_zone_select_toggle).pack(side=tk.LEFT, padx=2)
-        tk.Button(search_bar, text="Zone types...", command=self.open_zone_types_dialog).pack(side=tk.LEFT, padx=4)
+        troughs_row = self.mode_options['troughs']
+        tk.Checkbutton(troughs_row, text="Trough labels", variable=self.show_trough_labels,
+                        command=self.redraw).pack(side=tk.LEFT, padx=8, pady=2)
+        tk.Checkbutton(troughs_row, text="Show holes", variable=self.show_trough_holes,
+                        command=self.redraw).pack(side=tk.LEFT, padx=8)
 
-        body = tk.Frame(self)
+        body = tk.Frame(parent)
         body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
         self.canvas = tk.Canvas(body, bg="black")
@@ -148,10 +239,11 @@ class RegionViewerApp(tk.Tk):
         info_frame = tk.Frame(body, width=280)
         info_frame.pack(side=tk.RIGHT, fill=tk.Y)
         info_frame.pack_propagate(False)
-        tk.Label(info_frame, text="Section info", font=("TkDefaultFont", 11, "bold")).pack(
-            anchor="w", padx=8, pady=(8, 0))
+        self.info_title = tk.Label(info_frame, text="Section info", font=("TkDefaultFont", 11, "bold"))
+        self.info_title.pack(anchor="w", padx=8, pady=(8, 0))
         self.info_text = tk.Text(info_frame, wrap="word", state="disabled", height=30)
         self.info_text.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        self.info_text.tag_configure("category", font=("TkDefaultFont", 10, "bold"), foreground="#1a4f8a")
 
         self.canvas.bind("<Configure>", lambda e: self.redraw())
         self.canvas.bind("<ButtonPress-1>", self._on_press)
@@ -161,12 +253,83 @@ class RegionViewerApp(tk.Tk):
         self.canvas.bind("<Button-4>", lambda e: self._zoom(e, 1.15))   # Linux scroll up
         self.canvas.bind("<Button-5>", lambda e: self._zoom(e, 1 / 1.15))  # Linux scroll down
 
-        footer = tk.Frame(self)
-        footer.pack(side=tk.BOTTOM, fill=tk.X)
-        self.status_label = tk.Label(footer, text="No file loaded", anchor="w")
-        self.status_label.pack(side=tk.TOP, fill=tk.X, padx=6, pady=(2, 0))
-        self.stream_status_label = tk.Label(footer, text="No stream file loaded", anchor="w", fg="#888")
-        self.stream_status_label.pack(side=tk.TOP, fill=tk.X, padx=6, pady=(0, 2))
+    def _build_export_tab(self, parent):
+        sections_box = tk.LabelFrame(parent, text="sections.json", padx=10, pady=8)
+        sections_box.pack(side=tk.TOP, fill=tk.X, padx=10, pady=(10, 4))
+        tk.Label(sections_box, anchor="w", justify=tk.LEFT,
+                 text="Drivable-section boundary polygons plus each drivable section's related-section\n"
+                      "list, for the runtime streamer. Needs a region file and a stream file.").pack(anchor="w")
+        tk.Button(sections_box, text="Export sections.json...",
+                   command=self.export_sections_json).pack(anchor="w", pady=(6, 0))
+
+        nodes_box = tk.LabelFrame(parent, text="Road nodes", padx=10, pady=8)
+        nodes_box.pack(side=tk.TOP, fill=tk.X, padx=10, pady=4)
+        tk.Label(nodes_box, anchor="w", justify=tk.LEFT,
+                 text="Not written yet. The L5RA traffic node export will be added here.").pack(anchor="w")
+        tk.Button(nodes_box, text="Export road nodes...", state="disabled").pack(anchor="w", pady=(6, 0))
+
+    # ---------- Modes and layers ----------
+    def _on_mode_change(self):
+        """Shows the options row of the active mode and turns that layer on.
+        Does not touch the viewport. Clears the old selection so no info from
+        another layer stays next to a click in this one."""
+        mode = self.active_mode.get()
+        for row in self.mode_options.values():
+            row.pack_forget()
+        self.mode_options[mode].pack(side=tk.LEFT, fill=tk.X)
+        self.layer_vars[mode].set(True)
+        self.rotation_label.config(text=f"Rotation {self.road_rotation.get()} (Settings > Road network rotation)")
+        self.info_title.config(text=self.MODE_TITLES[mode])
+        self._update_order_label()
+        self.selected_id = None
+        self.selected_node_index = None
+        self.selected_zones = set()
+        self.selected_barriers = set()
+        self.selected_troughs = set()
+        self._show_hint(mode)
+        self.redraw()
+
+    def _show_hint(self, mode):
+        if mode == 'sections':
+            self._show_info(None)
+            return
+        hints = {
+            'nodes': ("No road network in this file." if self.world and not self.world.road_network
+                      else "Click a road node to inspect it."),
+            'zones': "Click a zone or barrier.",
+            'troughs': "Click inside a trough outline.",
+        }
+        self.info_text.config(state="normal")
+        self.info_text.delete("1.0", tk.END)
+        self.info_text.insert(tk.END, hints[mode])
+        self.info_text.config(state="disabled")
+
+    def _move_layer(self, step):
+        """Moves the active layer up (step 1) or down (step -1) in the draw
+        order. The last layer in layer_order is drawn on top. The viewport
+        stays where it is."""
+        key = self.active_mode.get()
+        index = self.layer_order.index(key)
+        new_index = index + step
+        if 0 <= new_index < len(self.layer_order):
+            self.layer_order[index], self.layer_order[new_index] = (
+                self.layer_order[new_index], self.layer_order[index])
+            self._update_order_label()
+            self.redraw()
+
+    def _update_order_label(self):
+        names = dict(self.MODES)
+        self.order_label.config(text="bottom > top:  " + "  <  ".join(names[k] for k in self.layer_order))
+
+    def _on_rotation_change(self):
+        """Rotation turns the road network nodes only, so the other layers and
+        the viewport stay where they are."""
+        self.rotation_label.config(text=f"Rotation {self.road_rotation.get()} (Settings > Road network rotation)")
+        visible = [key for key, var in self.layer_vars.items() if var.get()]
+        if visible == ['nodes']:
+            self.fit_to_view()   # the nodes moved and nothing else shows where
+        else:
+            self.redraw()
 
     def _on_game_change(self, event=None):
         if self.current_path:
@@ -215,7 +378,7 @@ class RegionViewerApp(tk.Tk):
         except Exception:
             pass  # not fatal - this is a bonus, not the primary load path
 
-        self._show_info(None)
+        self._show_hint(self.active_mode.get())
         self.fit_to_view()
 
     def open_stream_dialog(self):
@@ -243,13 +406,34 @@ class RegionViewerApp(tk.Tk):
             self.stream_scenery.merge(loaded)
             self.stream_path = f"{self.stream_path} + {path}"
         self.stream_status_label.config(text=f"Stream: {self.stream_scenery.summary()}", fg="#000000")
-        self._show_info(self.world.by_id.get(self.selected_id) if self.world else None)
+        if self.active_mode.get() == 'sections':
+            self._show_info(self.world.by_id.get(self.selected_id) if self.world else None)
+
+    def open_trough_dialog(self):
+        path = filedialog.askopenfilename(
+            title="Open TroughBoundary.bin",
+            filetypes=[("Trough boundary", "*.bin *.BIN"), ("All files", "*.*")])
+        if path:
+            self.load_trough_file(path)
+
+    def load_trough_file(self, path):
+        try:
+            loaded = load_trough_boundary(path)
+        except Exception as e:
+            messagebox.showerror("Failed to open trough file", str(e))
+            return
+        self.troughs = loaded
+        self.trough_path = path
+        self.selected_troughs = set()
+        self.trough_status_label.config(text=f"Troughs: {loaded.summary()}", fg="#000000")
+        self.redraw()
 
     def clear_stream_data(self):
         self.stream_scenery = None
         self.stream_path = None
         self.stream_status_label.config(text="No stream file loaded", fg="#888")
-        self._show_info(self.world.by_id.get(self.selected_id) if self.world else None)
+        if self.active_mode.get() == 'sections':
+            self._show_info(self.world.by_id.get(self.selected_id) if self.world else None)
 
     def _update_status(self, path):
         w = self.world
@@ -264,23 +448,32 @@ class RegionViewerApp(tk.Tk):
 
     # ---------- Coordinate transform ----------
     def fit_to_view(self):
+        """Fits the layers that are shown. If none of them has points (for
+        example only Zones shown), fits everything that has points."""
         if not self.world:
             return
-        mode = self.view_mode.get()
-        if mode == 'road network':
-            self._fit_to_road_network()
-        elif mode == 'combined':
-            self._fit_to_combined()
-        else:
-            self._fit_to_boundaries()
-
-    def _fit_to_boundaries(self):
-        if not self.world.boundaries:
-            return
-        xs, ys = self._boundary_points()
+        visible = [key for key, var in self.layer_vars.items() if var.get()]
+        xs, ys = self._extent_points(visible)
         if not xs:
-            return
-        self._fit_extent(min(xs), max(xs), min(ys), max(ys))
+            xs, ys = self._extent_points(['sections', 'nodes', 'troughs'])
+        if xs:
+            self._fit_extent(min(xs), max(xs), min(ys), max(ys))
+
+    def _extent_points(self, layers):
+        xs, ys = [], []
+        if 'sections' in layers:
+            bxs, bys = self._boundary_points()
+            xs += bxs
+            ys += bys
+        if 'nodes' in layers:
+            rxs, rys = self._road_points()
+            xs += rxs
+            ys += rys
+        if 'troughs' in layers and self.troughs:
+            for polygon in self.troughs.polygons:
+                xs += [polygon.bbox_min[0], polygon.bbox_max[0]]
+                ys += [polygon.bbox_min[1], polygon.bbox_max[1]]
+        return xs, ys
 
     def _boundary_points(self):
         xs, ys = [], []
@@ -307,26 +500,12 @@ class RegionViewerApp(tk.Tk):
             return y, -x
         return x, y
 
-    def _fit_to_road_network(self):
-        xs, ys = self._road_points()
-        if not xs:
-            return
-        self._fit_extent(min(xs), max(xs), min(ys), max(ys))
-
     def _road_points(self):
         rn = self.world.road_network
         if not rn or not rn.nodes:
             return [], []
         pts = [self._rotate_xy(n.position[0], n.position[2]) for n in rn.nodes]
         return [p[0] for p in pts], [p[1] for p in pts]
-
-    def _fit_to_combined(self):
-        bxs, bys = self._boundary_points()
-        rxs, rys = self._road_points()
-        xs, ys = bxs + rxs, bys + rys
-        if not xs:
-            return
-        self._fit_extent(min(xs), max(xs), min(ys), max(ys))
 
     def _fit_extent(self, min_x, max_x, min_y, max_y):
         w = max(max_x - min_x, 1.0)
@@ -376,16 +555,15 @@ class RegionViewerApp(tk.Tk):
         self.canvas.delete("all")
         if not self.world:
             return
-        mode = self.view_mode.get()
-        if mode == 'road network':
-            self._redraw_road_network()
-        elif mode == 'combined':
-            self._redraw_boundaries()
-            self._redraw_track_paths()
-            self._redraw_road_network()
-        else:
-            self._redraw_boundaries()
-            self._redraw_track_paths()
+        draw = {
+            'sections': self._redraw_boundaries,
+            'troughs': self._redraw_troughs,
+            'zones': self._redraw_track_paths,
+            'nodes': self._redraw_road_network,
+        }
+        for key in self.layer_order:   # bottom first, so the last layer ends up on top
+            if self.layer_vars[key].get():
+                draw[key]()
 
     def _node_half_width(self, rn, node):
         """Half of the node's profile total_width(), or None if this node
@@ -710,6 +888,70 @@ class RegionViewerApp(tk.Tk):
                                          font=("TkDefaultFont", 8),
                                          tags=(f"boundary_{b.ID}",))
 
+    # ---------- Troughs (TroughBoundary.bin) ----------
+    def _redraw_troughs(self):
+        if not self.troughs:
+            return
+        vx0, vy0, vx1, vy1 = self._visible_world_bounds()
+        show_labels = self.show_trough_labels.get()
+        show_holes = self.show_trough_holes.get()
+        for p in self.troughs.polygons:
+            if p.is_hole and not show_holes:
+                continue
+            if not self._bbox_intersects(p.bbox_min[0], p.bbox_min[1], p.bbox_max[0], p.bbox_max[1],
+                                          vx0, vy0, vx1, vy1):
+                continue
+            coords = []
+            for (x, y) in p.points:
+                coords.extend(self.world_to_canvas(x, y))
+            if len(coords) < 6:
+                continue
+            if p.index in self.selected_troughs:
+                color, width = "#ffffff", 3
+            elif p.is_hole:
+                color, width = "#ff6060", 1
+            else:
+                color, width = "#30d0a0", 1
+            self.canvas.create_polygon(coords, outline=color, fill="", width=width)
+            if show_labels:
+                lx, ly = self.world_to_canvas((p.bbox_min[0] + p.bbox_max[0]) / 2,
+                                              (p.bbox_min[1] + p.bbox_max[1]) / 2)
+                self.canvas.create_text(lx, ly, text=p.name, fill=color, font=("TkDefaultFont", 7))
+
+    def _append_trough_info(self, cx, cy):
+        """Writes the troughs under the click to the info panel. A click inside
+        a hole of a trough shows that hole. Sets the highlight set before the
+        caller redraws. Returns True when something was found."""
+        self.selected_troughs = set()
+        if not self.troughs:
+            return False
+        wx, wy = self.canvas_to_world(cx, cy)
+        lines = []
+        for p in self.troughs.polygons:
+            if p.is_hole:
+                continue
+            if not (p.bbox_min[0] <= wx <= p.bbox_max[0] and p.bbox_min[1] <= wy <= p.bbox_max[1]):
+                continue
+            if not _point_in_polygon(wx, wy, p.points):
+                continue
+            self.selected_troughs.add(p.index)
+            line = f"{p.name} (#{p.index}, {len(p.points)} points)"
+            for hole in self.troughs.holes_of(p):
+                if _point_in_polygon(wx, wy, hole.points):
+                    self.selected_troughs.add(hole.index)
+                    line += f"\n    inside hole {hole.name} (#{hole.index})"
+            lines.append(line)
+        self.info_text.config(state="normal")
+        self.info_text.delete("1.0", tk.END)
+        if lines:
+            self.info_text.insert(tk.END, f"troughs here ({len(lines)}):\n" + "\n".join(lines))
+        elif not self.troughs.polygons:
+            self.info_text.insert(tk.END, "No trough file loaded.")
+        else:
+            self.info_text.insert(tk.END, "No trough at this point.")
+        self.info_text.config(state="disabled")
+        return bool(lines)
+
     # ---------- Track path zones and barriers ----------
     def _track_path_status(self):
         """Status-bar text for the track path layer. Also prints two file
@@ -824,39 +1066,17 @@ class RegionViewerApp(tk.Tk):
                 lines.append(f"    data[{i}] = section {self.format_section_label(v)}{note}")
         return lines
 
-    def _on_zone_select_toggle(self):
-        """Clears the selection and the info panel when the mode changes, so
-        old section info does not stay next to a zone click (or the reverse)."""
-        self.selected_id = None
-        self.selected_zones = set()
-        self.selected_barriers = set()
-        if self.world:
-            text = ("Zone select mode: click a zone or barrier." if self.zone_select_mode.get()
-                    else "Click a section to inspect it.")
-            self.info_text.config(state="normal")
-            self.info_text.delete("1.0", tk.END)
-            self.info_text.insert(tk.END, text)
-            self.info_text.config(state="disabled")
-        self.redraw()
-
-    def _select_zone_at(self, cx, cy, mode):
-        """Click handler for zone select mode. Road nodes are tested first by
-        the caller, so they stay selectable in combined view. No section is
-        selected here."""
-        self.selected_id = None
-        self.selected_node_index = None
+    def _select_zone_at(self, cx, cy):
+        """Click handler for the Zones mode. Shows the zones under the click
+        and the barriers near it."""
         self.info_text.config(state="normal")
         self.info_text.delete("1.0", tk.END)
-        if mode == 'road network':
-            self.info_text.insert(tk.END, "Zones and barriers are not drawn in road network view. "
-                                           "Use the boundaries or combined view.")
+        self.info_text.config(state="disabled")
+        if not self._append_track_path_info(cx, cy, standalone=True):
+            self.info_text.config(state="normal")
+            self.info_text.insert(tk.END, "No zone or barrier at this point." if self.world.track_paths
+                                  else "No track path data in this file.")
             self.info_text.config(state="disabled")
-        else:
-            self.info_text.config(state="disabled")
-            if not self._append_track_path_info(cx, cy, standalone=True):
-                self.info_text.config(state="normal")
-                self.info_text.insert(tk.END, "No zone or barrier at this point.")
-                self.info_text.config(state="disabled")
         self.redraw()
 
     def _append_track_path_info(self, cx, cy, standalone=False):
@@ -1005,35 +1225,6 @@ class RegionViewerApp(tk.Tk):
         self.selected_id = section_number
         self.redraw()
         self._show_info(b)
-
-    def _guess_group_name(self):
-        if self.stream_scenery is None:
-            messagebox.showinfo("Guess group name", "Open a stream/region file first - no group data loaded yet.")
-            return
-        candidate = self.group_guess_var.get().strip()
-        if not candidate:
-            return
-
-        from nfs_hashing import bin_hash
-        target = bin_hash(candidate)
-        matches = self.stream_scenery.groups_matching_name(candidate)
-
-        self.info_text.config(state="normal")
-        self.info_text.delete("1.0", tk.END)
-        self.info_text.insert(tk.END, f"{candidate!r} hashes to 0x{target:08X}\n\n")
-        if matches:
-            self.info_text.insert(tk.END, f"Match! {len(matches)} loaded group(s) have this key:\n")
-            for g in matches:
-                sections = sorted({self.stream_scenery.overrides[idx].section_number
-                                    for idx in g.override_indices if idx < len(self.stream_scenery.overrides)})
-                section_labels = ", ".join(self.format_section_label(s) if self.world else str(s)
-                                            for s in sections) or "(none)"
-                self.info_text.insert(tk.END, f"  group_number={g.group_number}, "
-                                               f"{len(g.override_indices)} override(s), sections: {section_labels}\n")
-        else:
-            self.info_text.insert(tk.END, "No loaded group has this key - not a real name for this file "
-                                           "(or the group it belongs to isn't loaded).")
-        self.info_text.config(state="disabled")
 
     def open_group_view(self):
         if self.stream_scenery is None:
@@ -1189,33 +1380,40 @@ class RegionViewerApp(tk.Tk):
         self.redraw()
 
     def _select_at(self, cx, cy):
+        """A click only picks from the active mode's layer."""
         if not self.world:
             return
-        mode = self.view_mode.get()
+        mode = self.active_mode.get()
         self.selected_zones = set()
         self.selected_barriers = set()
-        if mode in ('road network', 'combined') and self.world.road_network:
+        self.selected_troughs = set()
+        if mode == 'nodes':
             node_idx = self._node_at_canvas(cx, cy)
+            self.selected_node_index = node_idx
+            self.selected_id = None
             if node_idx is not None:
-                self.selected_node_index = node_idx
-                self.selected_id = None
                 self._show_node_info(node_idx)
-                self.redraw()
-                return
-        if self.zone_select_mode.get():
-            self._select_zone_at(cx, cy, mode)
-            return
-        wx, wy = self.canvas_to_world(cx, cy)
-        hit = None
-        for b in self.world.boundaries:
-            if _point_in_polygon(wx, wy, b.points):
-                hit = b
-                break
-        self.selected_node_index = None
-        self.selected_id = hit.ID if hit else None
-        self._show_info(hit)
-        if mode != 'road network':
-            self._append_track_path_info(cx, cy)
+            else:
+                self._show_hint('nodes')
+        elif mode == 'zones':
+            self.selected_id = None
+            self.selected_node_index = None
+            self._select_zone_at(cx, cy)
+            return   # _select_zone_at redraws
+        elif mode == 'troughs':
+            self.selected_id = None
+            self.selected_node_index = None
+            self._append_trough_info(cx, cy)
+        else:
+            wx, wy = self.canvas_to_world(cx, cy)
+            hit = None
+            for b in self.world.boundaries:
+                if _point_in_polygon(wx, wy, b.points):
+                    hit = b
+                    break
+            self.selected_node_index = None
+            self.selected_id = hit.ID if hit else None
+            self._show_info(hit)
         self.redraw()
 
     def _node_at_canvas(self, cx, cy, tolerance=8):
@@ -1330,6 +1528,37 @@ class RegionViewerApp(tk.Tk):
             f"Wrote {len(sections)} drivable sections to {path}\n"
             f"{len(boundaryless_kept)} related sections have stream data but no boundary (kept).")
 
+    # Section info categories that start collapsed (long lists). Every other
+    # category starts open. The choice is kept between clicks in self.info_open.
+    INFO_COLLAPSED_BY_DEFAULT = ('scenery', 'overrides')
+
+    def _insert_category(self, key, title, body_lines):
+        """Adds a collapsible category to the info panel: a header line that
+        toggles its body when clicked. Call with the Text in normal state."""
+        is_open = self.info_open.setdefault(key, key not in self.INFO_COLLAPSED_BY_DEFAULT)
+        header_tag, body_tag = f"hdr_{key}", f"body_{key}"
+        arrow = "\u25bc" if is_open else "\u25b6"
+        self.info_text.insert(tk.END, f"{arrow} {title}\n", (header_tag, "category"))
+        self.info_text.insert(tk.END, "\n".join(f"    {line}" for line in body_lines) + "\n\n", (body_tag,))
+        self.info_text.tag_configure(body_tag, elide=not is_open)
+        self.info_text.tag_bind(header_tag, "<Button-1>", lambda e, k=key: self._toggle_category(k))
+        self.info_text.tag_bind(header_tag, "<Enter>", lambda e: self.info_text.config(cursor="hand2"))
+        self.info_text.tag_bind(header_tag, "<Leave>", lambda e: self.info_text.config(cursor=""))
+
+    def _toggle_category(self, key):
+        is_open = not self.info_open.get(key, True)
+        self.info_open[key] = is_open
+        header_tag = f"hdr_{key}"
+        self.info_text.config(state="normal")
+        self.info_text.tag_configure(f"body_{key}", elide=not is_open)
+        ranges = self.info_text.tag_ranges(header_tag)
+        if ranges:
+            start = ranges[0]
+            self.info_text.replace(start, f"{start}+1c", "\u25bc" if is_open else "\u25b6",
+                                   (header_tag, "category"))
+        self.info_text.config(state="disabled")
+        return "break"
+
     def _show_info(self, b):
         self.info_text.config(state="normal")
         self.info_text.delete("1.0", tk.END)
@@ -1352,10 +1581,12 @@ class RegionViewerApp(tk.Tk):
                 f"pos: ({b.pos[0]:.2f}, {b.pos[1]:.2f})",
                 f"boundsMin: ({b.boundsMin[0]:.2f}, {b.boundsMin[1]:.2f})",
                 f"boundsMax: ({b.boundsMax[0]:.2f}, {b.boundsMax[1]:.2f})",
-                f"points ({b.numPoints}):",
             ]
-            for p in b.points:
-                lines.append(f"    ({p[0]:.2f}, {p[1]:.2f})")
+            self.info_text.insert(tk.END, "\n".join(lines) + "\n\n")
+
+            self._insert_category('points', f"Points ({b.numPoints})",
+                                  [f"({p[0]:.2f}, {p[1]:.2f})" for p in b.points])
+
             def missing_reasons(i):
                 reasons = []
                 if i not in self.world.by_id:
@@ -1369,56 +1600,47 @@ class RegionViewerApp(tk.Tk):
             present_stale = [i for i in stale_ids if not missing_reasons(i)]
             missing_stale = [i for i in stale_ids if missing_reasons(i)]
 
-            lines.append("")
-            lines.append(f"related section IDs ({len(present_visible)}):")
-            if present_visible:
-                for i in present_visible:
-                    lines.append(f"    {self.format_section_label(i)}")
-            else:
-                lines.append("    (none)")
+            self._insert_category('related', f"Related sections ({len(present_visible)})",
+                                  [self.format_section_label(i) for i in present_visible] or ["(none)"])
 
             if stale_ids:
-                lines.append("")
-                lines.append(f"possibly stale, unk1 < dataCount ({len(present_stale)}) - "
-                              f"untested hypothesis, see nfs_region_prostreet.py:")
-                if present_stale:
-                    for i in present_stale:
-                        lines.append(f"    {self.format_section_label(i)}")
-                else:
-                    lines.append("    (none)")
+                self._insert_category(
+                    'stale', f"Possibly stale ({len(present_stale)})",
+                    ["unk1 < dataCount - untested hypothesis, see nfs_region_prostreet.py"]
+                    + ([self.format_section_label(i) for i in present_stale] or ["(none)"]))
 
             not_in_file = [(i, False) for i in missing_visible] + [(i, True) for i in missing_stale]
             if not_in_file:
-                lines.append("")
-                lines.append(f"not in this file ({len(not_in_file)}):")
+                body = []
                 for i, is_stale in not_in_file:
                     reasons = ", ".join(missing_reasons(i))
                     stale_tag = ", stale" if is_stale else ""
-                    lines.append(f"    {self.format_section_label(i)} - {reasons}{stale_tag}")
+                    body.append(f"{self.format_section_label(i)} - {reasons}{stale_tag}")
+                self._insert_category('missing', f"Not in this file ({len(not_in_file)})", body)
 
             if self.stream_scenery is not None:
-                lines.append("")
                 stream_section = self.stream_scenery.sections.get(b.ID)
                 if stream_section is not None:
-                    lines.append(f"scenery (stream file): {len(stream_section.instances)} instance(s)")
+                    body = []
                     for inst in stream_section.instances:
                         groups = self.stream_scenery.groups_for(b.ID, inst.instance_number)
                         group_str = (", groups: " + ", ".join(g.display_key() for g in groups)) if groups else ""
                         name = stream_section.name_for(inst)
                         name_str = f" ({name})" if name else ""
-                        lines.append(f"    #{inst.instance_number} guid=0x{inst.scenery_guid:08X}{name_str}{group_str}")
+                        body.append(f"#{inst.instance_number} guid=0x{inst.scenery_guid:08X}{name_str}{group_str}")
+                    self._insert_category('scenery', f"Scenery instances, stream file ({len(stream_section.instances)})",
+                                          body or ["(none)"])
                 else:
-                    lines.append("scenery (stream file): no instance data for this section")
+                    self._insert_category('scenery', "Scenery instances, stream file",
+                                          ["no instance data for this section"])
 
                 section_overrides = self.stream_scenery.overrides_for_section(b.ID)
                 if section_overrides:
-                    lines.append(f"override records for this section ({len(section_overrides)}):")
+                    body = []
                     for _idx, ov, groups in section_overrides:
                         group_str = (", groups: " + ", ".join(g.display_key() for g in groups)) if groups else ""
-                        lines.append(f"    instance #{ov.instance_number}: "
-                                     f"flags=0x{ov.instance_flags:04X}{group_str}")
-
-            self.info_text.insert(tk.END, "\n".join(lines))
+                        body.append(f"instance #{ov.instance_number}: flags=0x{ov.instance_flags:04X}{group_str}")
+                    self._insert_category('overrides', f"Override records ({len(section_overrides)})", body)
         self.info_text.config(state="disabled")
 
 

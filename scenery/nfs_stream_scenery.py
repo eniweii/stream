@@ -31,9 +31,14 @@ Command line - writes the scenery middleman files AssetDumper cannot write:
 Files go to outputs/nfs_stream_scenery/ (or --out DIR):
     scenery_groups.tsv     one row per group (key, name, barrier flags, ...)
     scenery_overrides.tsv  one row per group and override (section, instance, flags)
-    scenery_instances.tsv  only with --instances: AssetDumper's file plus the
-                           Groups (hex keys) and GroupNames columns, joined on
-                           Section + Instance
+    scenery_infos.tsv      one row per SceneryInfo (solid keys, radius, hierarchy
+                           hash, flags). Same columns as AssetDumper's file
+    scenery_instances.tsv  one row per instance (flags, flag names, bounding
+                           box). Same columns as AssetDumper's file, so no
+                           AssetDumper run is needed. With the region file, the
+                           Groups and GroupNames columns are added at the end.
+                           With --instances, AssetDumper's file is used instead
+                           and the Groups columns are joined on Section + Instance
 Checks are printed at the end (override indices outside the table, overrides
 for sections or instances that do not exist in the loaded stream data).
 
@@ -51,6 +56,7 @@ _sys.path[:0] = [str(_pl.Path(__file__).resolve().parents[1] / _d) for _d in ['c
 
 import argparse
 import csv
+import math
 import struct
 
 from nfs_region_common import walk_chunks
@@ -100,24 +106,31 @@ def decode_instance_flags(flags):
 
 
 class SceneryInfo:
-    __slots__ = ('name', 'solid_key', 'flags')
+    __slots__ = ('name', 'solid_key', 'flags', 'solid_keys', 'radius', 'hierarchy_hash')
 
-    def __init__(self, name, solid_key, flags):
+    def __init__(self, name, solid_key, flags, solid_keys, radius, hierarchy_hash):
         self.name = name
         self.solid_key = solid_key
         self.flags = flags
+        self.solid_keys = solid_keys  # the four LOD solid keys, as in SceneryInfoStruct
+        self.radius = radius
+        self.hierarchy_hash = hierarchy_hash
 
 
 class SceneryInstance:
-    __slots__ = ('instance_number', 'info_index', 'position', 'rotation', 'scenery_guid', 'flags')
+    __slots__ = ('instance_number', 'info_index', 'position', 'rotation', 'scenery_guid', 'flags',
+                 'bbox_min', 'bbox_max')
 
-    def __init__(self, instance_number, info_index, position, rotation, scenery_guid, flags):
+    def __init__(self, instance_number, info_index, position, rotation, scenery_guid, flags,
+                 bbox_min, bbox_max):
         self.instance_number = instance_number
         self.info_index = info_index
         self.position = position
         self.rotation = rotation  # 3x3 matrix as ((r0x,r0y,r0z),(r1x,r1y,r1z),(r2x,r2y,r2z))
         self.scenery_guid = scenery_guid
         self.flags = flags
+        self.bbox_min = bbox_min
+        self.bbox_max = bbox_max
 
     @property
     def flag_names(self):
@@ -197,7 +210,9 @@ def _parse_scenery_instances(data, payload_start, length):
     instance_number = 0
 
     while pos + 0x60 <= end:
+        bbox_min = struct.unpack_from('<fff', data, pos + 0x00)
         instance_flags = struct.unpack_from('<I', data, pos + 0x0C)[0]
+        bbox_max = struct.unpack_from('<fff', data, pos + 0x10)
         px, py, pz = struct.unpack_from('<fff', data, pos + 0x20)
         r0 = struct.unpack_from('<fff', data, pos + 0x2C)
         r1 = struct.unpack_from('<fff', data, pos + 0x38)
@@ -212,6 +227,8 @@ def _parse_scenery_instances(data, payload_start, length):
             rotation=(r0, r1, r2),
             scenery_guid=scenery_guid,
             flags=instance_flags,
+            bbox_min=bbox_min,
+            bbox_max=bbox_max,
         ))
 
         instance_number += 1
@@ -230,9 +247,13 @@ def _parse_scenery_infos(data, payload_start, length):
     while pos + 0x48 <= end:
         raw_name = data[pos:pos + 24]
         name = raw_name.split(b'\x00', 1)[0].decode('ascii', errors='replace')
-        solid_key = struct.unpack_from('<I', data, pos + 24)[0]
+        solid_keys = struct.unpack_from('<IIII', data, pos + 24)
+        solid_key = solid_keys[0]
+        radius = struct.unpack_from('<f', data, pos + 56)[0]
         flags = struct.unpack_from('<I', data, pos + 60)[0]
-        infos.append(SceneryInfo(name=name, solid_key=solid_key, flags=flags))
+        hierarchy_hash = struct.unpack_from('<I', data, pos + 64)[0]
+        infos.append(SceneryInfo(name=name, solid_key=solid_key, flags=flags,
+                                 solid_keys=solid_keys, radius=radius, hierarchy_hash=hierarchy_hash))
         pos += 0x48
 
     return infos
@@ -517,6 +538,139 @@ def write_instances_with_groups(scenery, instances_tsv, path):
     return with_groups
 
 
+def _net_float(value):
+    """Same text as C# float.ToString(CultureInfo.InvariantCulture) (.NET Core 3.0
+    and later): the shortest digits that read back as the same float32. Fixed
+    notation for exponents from -4 to 14, otherwise 'E+XX' / 'E-XX' (the upper
+    limit is not checked above 1E+9, far outside any game coordinate). Used so
+    the TSV files from this tool and from AssetDumper show the same text."""
+    if value != value:
+        return 'NaN'
+    if math.isinf(value):
+        return 'Infinity' if value > 0 else '-Infinity'
+    if value == 0:
+        return '-0' if math.copysign(1.0, value) < 0 else '0'
+
+    text = ''
+    for digits in range(1, 10):
+        text = f"{value:.{digits - 1}e}"
+        try:
+            if struct.unpack('<f', struct.pack('<f', float(text)))[0] == value:
+                break
+        except OverflowError:
+            pass  # too few digits near the float maximum: try one more digit
+
+    mantissa, exponent_text = text.split('e')
+    exponent = int(exponent_text)
+    sign = '-' if mantissa.startswith('-') else ''
+    digit_string = mantissa.lstrip('-').replace('.', '').rstrip('0') or '0'
+
+    if -5 < exponent < 15:
+        if exponent >= 0:
+            digit_string = digit_string.ljust(exponent + 1, '0')
+            whole, fraction = digit_string[:exponent + 1], digit_string[exponent + 1:]
+            return sign + whole + ('.' + fraction if fraction else '')
+        return sign + '0.' + '0' * (-exponent - 1) + digit_string
+
+    scientific = digit_string[0] + ('.' + digit_string[1:] if len(digit_string) > 1 else '')
+    return f"{sign}{scientific}E{'+' if exponent >= 0 else '-'}{abs(exponent):02d}"
+
+
+def _csharp_flag_names(flags):
+    """Flag names as C# SceneryInstanceFlags.ToString() writes them: PascalCase,
+    lowest bit first, '|' between names, 'None' for zero."""
+    names = [''.join(part.capitalize() for part in name.split('_'))
+             for name in decode_instance_flags(flags)]
+    return '|'.join(names) if names else 'None'
+
+
+def _clean(value):
+    # A tab or a line break inside a name would break the columns
+    return (value or '').replace('\t', ' ').replace('\r', ' ').replace('\n', ' ')
+
+
+def write_infos_tsv(scenery, path):
+    """scenery_infos.tsv straight from the stream file. Same columns, same order
+    and same text as SceneryManifestWriter.cs in AssetDumper. Returns the row count."""
+    rows = []
+    for section_number in sorted(scenery.sections):
+        section = scenery.sections[section_number]
+        for info_index, info in enumerate(section.infos):
+            rows.append([
+                section_number, info_index, _clean(info.name),
+                _hex(info.solid_keys[0]), _hex(info.solid_keys[1]),
+                _hex(info.solid_keys[2]), _hex(info.solid_keys[3]),
+                _net_float(info.radius), _hex(info.hierarchy_hash), _hex(info.flags),
+            ])
+
+    _write_tsv(path, ['Section', 'Info', 'Name', 'SolidKey1', 'SolidKey2', 'SolidKey3',
+                      'SolidKey4', 'Radius', 'HierarchyHash', 'Flags'], rows)
+    return len(rows)
+
+
+def write_instances_tsv(scenery, path, with_groups, collision_matches=None):
+    """scenery_instances.tsv straight from the stream file. Same columns, same
+    order and same text as SceneryManifestWriter.cs in AssetDumper. With
+    with_groups (the region file is loaded), the Groups and GroupNames columns
+    are added at the end, same as write_instances_with_groups. With
+    collision_matches (from nfs_collision_pack.match_to_scenery), the
+    HasCollision and CollisionIndex columns come last: 1 and the index of the
+    collision instance in that section's pack, or 0 and an empty cell. The
+    link is a position match, not an index. Returns the number of rows and the
+    number of instances that belong to a group."""
+    header = ['Section', 'Instance', 'Guid', 'Info', 'Name', 'Flags', 'FlagNames',
+              'BBoxMinX', 'BBoxMinY', 'BBoxMinZ', 'BBoxMaxX', 'BBoxMaxY', 'BBoxMaxZ']
+    if with_groups:
+        header += ['Groups', 'GroupNames']
+    if collision_matches is not None:
+        header += ['HasCollision', 'CollisionIndex']
+
+    rows = []
+    in_group = 0
+    for section_number in sorted(scenery.sections):
+        section = scenery.sections[section_number]
+        for instance in section.instances:
+            row = [
+                section_number, instance.instance_number, _hex(instance.scenery_guid),
+                instance.info_index, _clean(section.name_for(instance)),
+                _hex(instance.flags), _csharp_flag_names(instance.flags),
+                *(_net_float(v) for v in instance.bbox_min),
+                *(_net_float(v) for v in instance.bbox_max),
+            ]
+            if with_groups:
+                hits = scenery.groups_for(section_number, instance.instance_number)
+                if hits:
+                    in_group += 1
+                row.append('|'.join(_hex(g.key) for g in hits))
+                row.append('|'.join(g.name or _hex(g.key) for g in hits))
+            if collision_matches is not None:
+                collision_index = collision_matches.get((section_number, instance.instance_number))
+                row.append(0 if collision_index is None else 1)
+                row.append('' if collision_index is None else collision_index)
+            rows.append(row)
+
+    _write_tsv(path, header, rows)
+    return len(rows), in_group
+
+
+def check_flags(scenery):
+    """Prints how many instances have the flags we care about. A count of zero
+    for every flag on a real file means the flag word is read from a wrong offset."""
+    total = swayable = enable_wind = both = collidable = 0
+    for section in scenery.sections.values():
+        for instance in section.instances:
+            total += 1
+            is_sway = bool(instance.flags & (1 << 14))
+            is_wind = bool(instance.flags & (1 << 15))
+            swayable += is_sway
+            enable_wind += is_wind
+            both += is_sway and is_wind
+            collidable += bool(instance.flags & (1 << 30))
+
+    print(f"[nfs_stream_scenery] check: {total} instance(s), {swayable} swayable, "
+          f"{enable_wind} enable_wind ({both} with both), {collidable} collidable")
+
+
 def check_scenery(scenery):
     """Prints the sanity checks. A wrong read (for example the group padding
     rule) shows up as indices that point nowhere."""
@@ -548,7 +702,12 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="Write the scenery group TSV files (see the module docstring).")
     ap.add_argument('stream_bun', help="stream file (STREAML5RA.BUN): the scenery instances")
     ap.add_argument('region_bun', nargs='?', help="region file (L5RA.BUN): the override groups")
-    ap.add_argument('--instances', help="AssetDumper's scenery_instances.tsv, to add the Groups columns")
+    ap.add_argument('--instances', help="AssetDumper's scenery_instances.tsv, to add the Groups columns "
+                                        "(optional: without it, this tool writes its own scenery_instances.tsv)")
+    ap.add_argument('--collision', action='store_true',
+                    help="also read the collision packs (chunk 0x3B801) from the stream file, write "
+                         "collision_instances.tsv and add HasCollision and CollisionIndex to "
+                         "scenery_instances.tsv. Reads the stream file a second time")
     ap.add_argument('--out', help="output folder (default outputs/nfs_stream_scenery/)")
     args = ap.parse_args(argv)
 
@@ -567,10 +726,32 @@ def main(argv=None):
     write_overrides_tsv(scenery, out / 'scenery_overrides.tsv')
     print(f"[nfs_stream_scenery] wrote scenery_groups.tsv and scenery_overrides.tsv to {out}")
 
+    info_count = write_infos_tsv(scenery, out / 'scenery_infos.tsv')
+    print(f"[nfs_stream_scenery] wrote scenery_infos.tsv, {info_count} info(s)")
+
     if args.instances:
         with_groups = write_instances_with_groups(scenery, args.instances, out / 'scenery_instances.tsv')
-        print(f"[nfs_stream_scenery] wrote scenery_instances.tsv, {with_groups} instance(s) belong to a group")
+        print(f"[nfs_stream_scenery] wrote scenery_instances.tsv (from --instances), "
+              f"{with_groups} instance(s) belong to a group")
+    else:
+        collision_matches = None
+        if args.collision:
+            from nfs_collision_pack import (load_collision_packs, match_to_scenery,
+                                            write_collision_instances_tsv, summary as collision_summary)
+            packs = load_collision_packs(args.stream_bun)
+            print(f"[nfs_stream_scenery] {collision_summary(packs)}")
+            write_collision_instances_tsv(packs, out / 'collision_instances.tsv')
+            collision_matches, report = match_to_scenery(packs, scenery)
+            print(f"[nfs_stream_scenery] {report}")
+            if not collision_matches:
+                collision_matches = None   # no usable match: leave the two columns out
+        row_count, with_groups = write_instances_tsv(scenery, out / 'scenery_instances.tsv',
+                                                     with_groups=bool(args.region_bun),
+                                                     collision_matches=collision_matches)
+        print(f"[nfs_stream_scenery] wrote scenery_instances.tsv, {row_count} instance(s)"
+              + (f", {with_groups} belong to a group" if args.region_bun else ""))
 
+    check_flags(scenery)
     check_scenery(scenery)
 
 

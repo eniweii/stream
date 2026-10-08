@@ -8,15 +8,14 @@ this list. Byte ranges are offsets inside one record.
 
 **nfs_stream_scenery.py** (Tier 1, items 1-3)
 - Header 0x34101: only the section number (+0x0C) is read. The rest is dropped.
-- SceneryInfo 0x34102 (0x48 bytes): reads name (24 bytes), the first solid key (+0x18), and flags (+0x3C).
-  Not read: the other three solid keys (+0x1C, +0x20, +0x24), +0x28..+0x3B, +0x40..+0x47.
-  `flares/flare_scenery_scan.py` reads `solid_keys[4]` on its own. This module does not.
-- SceneryInstance 0x34103 (0x60 bytes): reads flags, position, rotation, guid, info index.
-  Not read: +0x00..+0x0B, +0x10..+0x1F, +0x56..+0x5F.
+- SceneryInfo 0x34102 (0x48 bytes): reads name (24 bytes), the four solid keys (+0x18), radius (+0x38), flags (+0x3C) and hierarchy hash (+0x40).
+  Not read: the four solid pointers (+0x28..+0x37, runtime values) and the hierarchy pointer (+0x44).
+- SceneryInstance 0x34103 (0x60 bytes): reads bounding box (+0x00, +0x10), flags, position, rotation, guid, info index.
+  Not read on purpose, same as the C# reader: preculler index (+0x1C) and lighting context (+0x1E), and +0x56..+0x5F (C# calls it padding).
 - Other chunks inside a 0x80034100 section are skipped: 0x34105 tree nodes, 0x34107 preculler, 0x3410D.
 - Override infos (0x34108) and groups (0x34109): every field is read. No gap. They are in the REGION file, so load both files (the command line takes both).
 - Group padding rule: tries always-advance first, then pad-only-if-unaligned, and keeps the one that ends exactly on the chunk end. Prints a warning when neither fits.
-- Command line TSV export (`scenery_groups.tsv`, `scenery_overrides.tsv`, `--instances` join): tested on synthetic files only.
+- Command line TSV export: `scenery_groups.tsv`, `scenery_overrides.tsv`, `scenery_infos.tsv`, `scenery_instances.tsv` (same columns and text as AssetDumper's SceneryManifestWriter, no AssetDumper run needed), and the `--instances` join. Tested on synthetic files only. Not yet compared with an AssetDumper TSV from a real file.
 - (doc) Not run against a real file.
 
 **nfs_scenery_dae_scan.py** (doc) Not verified against a real exported .dae.
@@ -101,6 +100,8 @@ bias level, flags, rendering order, mipmap bias. (The C# reader keeps these; see
 
 - **nfs_trackpath.py** Zone `user_data` is a runtime pointer, kept raw. `data[4]` is kept raw. Barriers are fully read.
 - **nfs_carp_parser.py** (doc) Container offsets are confirmed on a ProStreet file. Field values are not checked.
+- **nfs_trough_boundary.py** TroughBoundary.bin is fully read and checked on the real Carbon file (808 polygons, sizes and bounding boxes match). Not checked: which two axes the points use. No antitrough or barrier record exists in that file. The chunk IDs 0x34180..0x34183 (troughs, perimeter, quad tree) are not in that file and are not read.
+- **nfs_collision_pack.py** Chunk 0x3B801, `ci` records only (0x44 bytes, layout from UCGT). Not read: the `hk` Havok articles, the `si` surface triggers and the inverse matrix rows beyond the two kept. Tested on a synthetic file only. The scenery match in `--collision` is by position: the axis order is picked from the data and printed. Read that line before you trust `HasCollision`.
 - **nfs_region_undercover.py** (doc) Ported from UCGT. Not checked on a real Undercover file.
 - **nfs_region_mw.py** (doc) Derived from decompiled source. Not hex-verified.
 - **nfs_region_common.py** `ChunkBoundary` fields `unk2` and `unk3` have no known meaning.
@@ -113,8 +114,8 @@ bias level, flags, rendering order, mipmap bias. (The C# reader keeps these; see
 
 | Roadmap item | Gap |
 |---|---|
-| T1.1 SceneryInfo | Solid keys 2-4 not read in `nfs_stream_scenery.py` |
-| T1.2 SceneryInstance | Flags read, but three byte ranges unread; flare tool does not apply them |
+| T1.1 SceneryInfo | Closed in `nfs_stream_scenery.py` (all four solid keys, radius, hierarchy hash) |
+| T1.2 SceneryInstance | Bounding box and flags read and exported; flare tool does not apply the flags |
 | T1.4 Materials | Shading group bytes +0x1E..+0x2F and others unread; texture list second u32 dropped |
 | T1.5 SolidMarkers | One LOD only; 44 size-92 chunks open; flags and groups not applied |
 | T1.7 Texture anim | Scanner only: no structured output, frame entry bytes 4-11 and inst/pack containers unread |

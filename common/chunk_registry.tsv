@@ -43,7 +43,7 @@ chunk_id	name	file	status	tool	roadmap	note
 0x00036001	EventTrigger header	stream	set-aside	triggers/world_event_trigger_scan.py	T2	-
 0x00036002	EventTrigger AABB tree	stream	set-aside	triggers/world_event_trigger_scan.py	T2	leaves sampled only
 0x00036003	EventTrigger records	stream	set-aside	triggers/world_event_trigger_scan.py	T2	-
-0x0003B801	unknown (not CARP 0x3B800)	unlabeled	unread		T2	hex-check first
+0x0003B801	Collision pack (WCollisionPack), one per section	stream	partial	region/nfs_collision_pack.py	T2	ci records read; hk articles and si unread; layout from UCGT
 0x0003B802	unknown (not CARP 0x3B800)	unlabeled	unread		T2	hex-check first
 0x00034027	unknown	unlabeled	unread		T2	-
 0x00034191	unknown	unlabeled	unread		T2	-
@@ -57,3 +57,4 @@ chunk_id	name	file	status	tool	roadmap	note
 0x80034150	VisibleSections (container)	region	out-of-scope	region/nfs_region_parser.py	region	-
 0x00034153	VisibleSections boundaries	region	out-of-scope	region/nfs_region_parser.py	region	-
 0x0003B800	CARP world grid	region	out-of-scope	region/nfs_carp_parser.py	region	own offset-table format
+0x57944655	TroughBoundary polygon (TroughBoundary.bin, a separate file)	other	done	region/nfs_trough_boundary.py	-	one named 2D polygon per chunk; flags 1 trough, 256 hole
