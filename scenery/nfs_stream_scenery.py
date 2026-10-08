@@ -608,22 +608,37 @@ def write_infos_tsv(scenery, path):
     return len(rows)
 
 
-def write_instances_tsv(scenery, path, with_groups, collision_matches=None):
+def write_instances_tsv(scenery, path, with_groups, collision_matches=None, object_matches=None,
+                        group_links=None):
     """scenery_instances.tsv straight from the stream file. Same columns, same
     order and same text as SceneryManifestWriter.cs in AssetDumper. With
     with_groups (the region file is loaded), the Groups and GroupNames columns
     are added at the end, same as write_instances_with_groups. With
-    collision_matches (from nfs_collision_pack.match_to_scenery), the
-    HasCollision and CollisionIndex columns come last: 1 and the index of the
-    collision instance in that section's pack, or 0 and an empty cell. The
-    link is a position match, not an index. Returns the number of rows and the
-    number of instances that belong to a group."""
+    collision_matches (from nfs_collision_pack.match_to_scenery) or object_matches
+    (from nfs_collision_pack.match_objects_to_scenery), the HasCollision,
+    CollisionIndex, CollisionObject and CollisionObjectMethod columns come last:
+    HasCollision is 1 when an instance or an object matched; CollisionIndex is the
+    index of the collision instance in that section's pack, CollisionObject the
+    index of the collision object and CollisionObjectMethod the method that placed
+    it (index, position or inside); empty cells when there is none. With group_links (from
+    nfs_collision_pack.match_by_group) the CollisionGroupIndexes column is added after
+    them: the indexes, joined with |, of the collision instances whose group number is a
+    group touching this scenery instance (the link MW itself uses). The link is a
+    match by index or position, see nfs_collision_pack. Returns the number of rows
+    and the number of instances that belong to a group."""
     header = ['Section', 'Instance', 'Guid', 'Info', 'Name', 'Flags', 'FlagNames',
               'BBoxMinX', 'BBoxMinY', 'BBoxMinZ', 'BBoxMaxX', 'BBoxMaxY', 'BBoxMaxZ']
     if with_groups:
         header += ['Groups', 'GroupNames']
-    if collision_matches is not None:
-        header += ['HasCollision', 'CollisionIndex']
+    with_collision = collision_matches is not None or object_matches is not None
+    with_group_links = group_links is not None
+    group_links = group_links or {}
+    collision_matches = collision_matches or {}
+    object_matches = object_matches or {}
+    if with_collision:
+        header += ['HasCollision', 'CollisionIndex', 'CollisionObject', 'CollisionObjectMethod']
+    if with_group_links:
+        header += ['CollisionGroupIndexes']
 
     rows = []
     in_group = 0
@@ -643,10 +658,17 @@ def write_instances_tsv(scenery, path, with_groups, collision_matches=None):
                     in_group += 1
                 row.append('|'.join(_hex(g.key) for g in hits))
                 row.append('|'.join(g.name or _hex(g.key) for g in hits))
-            if collision_matches is not None:
-                collision_index = collision_matches.get((section_number, instance.instance_number))
-                row.append(0 if collision_index is None else 1)
+            if with_collision:
+                key = (section_number, instance.instance_number)
+                collision_index = collision_matches.get(key)
+                object_match = object_matches.get(key)
+                row.append(0 if collision_index is None and object_match is None else 1)
                 row.append('' if collision_index is None else collision_index)
+                row.append('' if object_match is None else object_match[1])
+                row.append('' if object_match is None else object_match[0])
+            if with_group_links:
+                row.append('|'.join(str(i) for i in group_links.get(
+                    (section_number, instance.instance_number), [])))
             rows.append(row)
 
     _write_tsv(path, header, rows)
@@ -706,8 +728,9 @@ def main(argv=None):
                                         "(optional: without it, this tool writes its own scenery_instances.tsv)")
     ap.add_argument('--collision', action='store_true',
                     help="also read the collision packs (chunk 0x3B801) from the stream file, write "
-                         "collision_instances.tsv and add HasCollision and CollisionIndex to "
-                         "scenery_instances.tsv. Reads the stream file a second time")
+                         "collision_instances.tsv and add HasCollision, CollisionIndex, "
+                         "CollisionObject and CollisionObjectMethod to scenery_instances.tsv. "
+                         "Reads the stream file a second time")
     ap.add_argument('--out', help="output folder (default outputs/nfs_stream_scenery/)")
     args = ap.parse_args(argv)
 
@@ -735,19 +758,35 @@ def main(argv=None):
               f"{with_groups} instance(s) belong to a group")
     else:
         collision_matches = None
+        object_matches = None
+        group_links = None
         if args.collision:
             from nfs_collision_pack import (load_collision_packs, match_to_scenery,
+                                            match_objects_to_scenery, match_by_group,
                                             write_collision_instances_tsv, summary as collision_summary)
             packs = load_collision_packs(args.stream_bun)
             print(f"[nfs_stream_scenery] {collision_summary(packs)}")
             write_collision_instances_tsv(packs, out / 'collision_instances.tsv')
-            collision_matches, report = match_to_scenery(packs, scenery)
-            print(f"[nfs_stream_scenery] {report}")
+            group_links, group_reports = match_by_group(packs, scenery)
+            for line in group_reports:
+                print(f"[nfs_stream_scenery] {line}")
+            if not group_links:
+                group_links = None
+            collision_matches, reports = match_to_scenery(packs, scenery)
+            for line in reports:
+                print(f"[nfs_stream_scenery] {line}")
+            object_matches, object_reports = match_objects_to_scenery(packs, scenery)
+            for line in object_reports:
+                print(f"[nfs_stream_scenery] {line}")
             if not collision_matches:
-                collision_matches = None   # no usable match: leave the two columns out
+                collision_matches = None   # no usable match: no instance link
+            if not object_matches:
+                object_matches = None      # no usable match: no object link
         row_count, with_groups = write_instances_tsv(scenery, out / 'scenery_instances.tsv',
                                                      with_groups=bool(args.region_bun),
-                                                     collision_matches=collision_matches)
+                                                     collision_matches=collision_matches,
+                                                     object_matches=object_matches,
+                                                     group_links=group_links)
         print(f"[nfs_stream_scenery] wrote scenery_instances.tsv, {row_count} instance(s)"
               + (f", {with_groups} belong to a group" if args.region_bun else ""))
 
