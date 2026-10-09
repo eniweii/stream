@@ -645,10 +645,11 @@ def _mapped_box(corners, order, signs):
             tuple(max(p[i] for p in points) for i in range(3)))
 
 
-def _match_by_geometry(packs, scenery, min_rate, matches):
+def _match_by_geometry(packs, scenery, min_rate, matches, diagnostics=None):
     """Method 1 for instances: the bounding box of the article (strip vertices) against the
     bounding box of a scenery instance, volume overlap >= GEOMETRY_IOU. Adds to matches
-    and returns one report line."""
+    and returns one report line. With a list as diagnostics, one row per collision instance
+    is added to it (see write_collision_geometry_tsv)."""
     prepared = []   # (pack, hash of scenery bbox centers, boxes by instance number, corners by index)
     for pack, section in _pairs(packs, scenery, need_objects=False):
         centers = [(inst.instance_number, tuple((inst.bbox_min[i] + inst.bbox_max[i]) / 2.0
@@ -680,6 +681,30 @@ def _match_by_geometry(packs, scenery, min_rate, matches):
     if reason:
         return f"{text}; NOT used: {reason}"
 
+    all_table = all_boxes = None
+    if diagnostics is not None:
+        # every scenery instance of every section, to see whether a collision box that fits
+        # nothing in its own section fits scenery of another section
+        all_points = []
+        all_boxes = {}
+        for section_number, section in scenery.sections.items():
+            for inst in section.instances:
+                key = (section_number, inst.instance_number)
+                all_points.append((key, tuple((inst.bbox_min[i] + inst.bbox_max[i]) / 2.0
+                                              for i in range(3))))
+                all_boxes[key] = (inst.bbox_min, inst.bbox_max)
+        all_table = _build_hash(all_points, GEOMETRY_CELL)
+
+    def best_overlap(table, boxes, box_corners):
+        low, high = _mapped_box(box_corners, order, signs)
+        center = tuple((low[i] + high[i]) / 2.0 for i in range(3))
+        best = (0.0, '')
+        for _distance, number in _near(table, center, GEOMETRY_CELL, GEOMETRY_CELL):
+            iou = _box_iou(low, high, boxes[number][0], boxes[number][1], GEOMETRY_MARGIN)
+            if iou > best[0]:
+                best = (iou, number)
+        return best
+
     placed = []
     total = 0
     for pack, table, boxes, corners in prepared:
@@ -699,6 +724,50 @@ def _match_by_geometry(packs, scenery, min_rate, matches):
             matches[(pack.section_number, number)] = collision_index
             placed.append(-negative_iou)
         total += len(pack.instances)
+        if diagnostics is not None:
+            taken = {ci_index for (sec, _n), ci_index in matches.items() if sec == pack.section_number}
+            for ci in pack.instances:
+                article = pack.articles.get(ci.instance_id)
+                strips = article.strip_count if article else 0
+                edges = article.edge_count if article else 0
+                triangles = article.triangle_count() if article else 0
+                if corners[ci.index] is None:
+                    iou, number, status = 0.0, '', 'no strips in the article'
+                else:
+                    iou, number = best_overlap(table, boxes, corners[ci.index])
+                    if ci.index in taken:
+                        status = 'matched'
+                    elif iou >= GEOMETRY_IOU:
+                        status = 'overlaps, but that scenery instance went to another'
+                    else:
+                        status = 'overlap below threshold' if iou > 0 else 'no scenery box nearby'
+                        other_iou, other_key = best_overlap(all_table, all_boxes, corners[ci.index])
+                        if other_iou >= GEOMETRY_IOU:
+                            status = 'overlaps scenery of another section'
+                            iou, number = other_iou, f"{other_key[0]}:{other_key[1]}"
+                diagnostics.append([pack.section_number, ci.index, ci.group_number, strips, edges,
+                                    triangles, f"{iou:.3f}", number, status])
+    if diagnostics is not None:
+        in_prepared = {pack.section_number for pack, _t, _b, _c in prepared}
+        for pack in packs:
+            if pack.section_number in in_prepared:
+                continue
+            for ci in pack.instances:
+                article = pack.articles.get(ci.instance_id)
+                box_corners = _article_corners(pack, ci)
+                iou, number, status = 0.0, '', 'no scenery instances in this section'
+                if box_corners is None:
+                    status = 'no strips in the article'
+                else:
+                    other_iou, other_key = best_overlap(all_table, all_boxes, box_corners)
+                    if other_iou >= GEOMETRY_IOU:
+                        status = 'overlaps scenery of another section'
+                        iou, number = other_iou, f"{other_key[0]}:{other_key[1]}"
+                diagnostics.append([pack.section_number, ci.index, ci.group_number,
+                                    article.strip_count if article else 0,
+                                    article.edge_count if article else 0,
+                                    article.triangle_count() if article else 0, f"{iou:.3f}",
+                                    number, status])
     placed.sort()
     median = placed[len(placed) // 2] if placed else 0.0
     return f"{text}; used, {len(placed)} of {total} collision instance(s) matched, median overlap {median:.0%}"
@@ -761,7 +830,7 @@ def _match_by_position(packs, scenery, min_rate, matches):
     return f"{text}; used, {added} more instance(s) placed of {total}"
 
 
-def match_to_scenery(packs, scenery, min_rate=MIN_MATCH_RATE):
+def match_to_scenery(packs, scenery, min_rate=MIN_MATCH_RATE, diagnostics=None):
     """Finds which scenery instance each collision INSTANCE belongs to. Two methods, in
     this order; each prints its own hit rate and is used only when the rate reaches
     min_rate and the best axis order stands clear of the runner-up:
@@ -773,7 +842,7 @@ def match_to_scenery(packs, scenery, min_rate=MIN_MATCH_RATE):
     instance in that section's pack, and is empty when no method passes. reports is a
     list of console lines."""
     matches = {}
-    reports = [_match_by_geometry(packs, scenery, min_rate, matches),
+    reports = [_match_by_geometry(packs, scenery, min_rate, matches, diagnostics),
                _match_by_position(packs, scenery, min_rate, matches)]
     reports.append(f"collision match: {len(matches)} scenery instance(s) got a collision instance")
     return matches, reports
@@ -1041,6 +1110,15 @@ def write_collision_objects_tsv(packs, path):
     return len(rows)
 
 
+def write_collision_geometry_tsv(rows, path):
+    """One row per collision instance from the geometry method: why it did or did not match.
+    Overlap is the best volume overlap with a scenery box nearby, Scenery that box's
+    instance number."""
+    _write_tsv(path, ['Section', 'Index', 'Group', 'Strips', 'Edges', 'Triangles', 'Overlap',
+                      'Scenery', 'Status'], sorted(rows, key=lambda r: (r[0], r[1])))
+    return len(rows)
+
+
 def write_tag_census_tsv(packs, path):
     census = tag_census(packs)
     rows = [[key, c[0], c[1], c[2], c[3][0], c[3][1]] for key, c in sorted(census.items())]
@@ -1070,6 +1148,88 @@ def write_collision_obj(pack, path):
                 vertex_base += len(strip.vertices)
 
 
+def collision_drawables(packs):
+    """What the region viewer draws, in game world coordinates (x, y up, z).
+    Returns (pieces, walls).
+    pieces: one per instance whose article has strips: (section, index, group, strips,
+            edges, triangles, min x, min z, max x, max z) of the article box.
+    walls:  one per barrier edge: (section, index, group, x0, z0, x1, z1, y bottom, y top).
+            A barrier is two points and two heights: a 2D segment stood up between
+            YBot and YTop (MW WCollisionBarrier)."""
+    pieces, walls = [], []
+    for pack in packs:
+        for ci in pack.instances:
+            article = pack.articles.get(ci.instance_id)
+            if article is None:
+                continue
+            position = true_position(ci)
+            corners = _article_corners(pack, ci)
+            if corners is not None:
+                pieces.append((pack.section_number, ci.index, ci.group_number, article.strip_count,
+                               article.edge_count, article.triangle_count(),
+                               min(c[0] for c in corners), min(c[2] for c in corners),
+                               max(c[0] for c in corners), max(c[2] for c in corners)))
+            for edge in article.edges:
+                a = local_to_world(ci, edge.minimum, position)
+                b = local_to_world(ci, edge.maximum, position)
+                walls.append((pack.section_number, ci.index, ci.group_number, a[0], a[2], b[0], b[2],
+                              min(a[1], b[1]), max(a[1], b[1])))
+    return pieces, walls
+
+
+def _point_segment_distance(px, py, ax, ay, bx, by):
+    dx, dy = bx - ax, by - ay
+    length_sq = dx * dx + dy * dy
+    t = 0.0 if length_sq == 0 else max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / length_sq))
+    return ((px - (ax + t * dx)) ** 2 + (py - (ay + t * dy)) ** 2) ** 0.5
+
+
+def barrier_trough_check(packs, troughs, near=1.0, far=5.0):
+    """Tests the idea that the vertical walls are the trough outlines stood up. Every barrier
+    end point is moved to the plane of the trough file (x = game z, y = -game x, the plane
+    of the section boundaries) and measured against the trough and hole outlines.
+    Returns report lines."""
+    cell = 64.0
+    buckets = {}
+    for polygon in troughs.polygons:
+        points = polygon.points
+        for i in range(len(points)):
+            a, b = points[i], points[(i + 1) % len(points)]
+            for cx in range(int(min(a[0], b[0]) // cell), int(max(a[0], b[0]) // cell) + 1):
+                for cy in range(int(min(a[1], b[1]) // cell), int(max(a[1], b[1]) // cell) + 1):
+                    buckets.setdefault((cx, cy), []).append((a, b, polygon))
+    _pieces, walls = collision_drawables(packs)
+    if not walls:
+        return ["barrier check: no barrier edges in the packs"]
+    counts = {'near': 0, 'far': 0}
+    names = {}
+    total = 0
+    for wall in walls:
+        for x, z in ((wall[3], wall[4]), (wall[5], wall[6])):
+            px, py = z, -x
+            best = None
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for a, b, polygon in buckets.get((int(px // cell) + dx, int(py // cell) + dy), ()):
+                        d = _point_segment_distance(px, py, a[0], a[1], b[0], b[1])
+                        if best is None or d < best[0]:
+                            best = (d, polygon)
+            total += 1
+            if best is not None and best[0] <= far:
+                counts['far'] += 1
+                if best[0] <= near:
+                    counts['near'] += 1
+                    names[best[1].name] = names.get(best[1].name, 0) + 1
+    grouped = sum(1 for w in walls if w[2])
+    lines = [f"barrier check: {len(walls)} barrier edge(s) ({grouped} with a group number), "
+             f"{total} end point(s); within {near:g} of a trough or hole outline: "
+             f"{counts['near'] / total:.0%}; within {far:g}: {counts['far'] / total:.0%}"]
+    if names:
+        top = sorted(names.items(), key=lambda kv: -kv[1])[:5]
+        lines.append("barrier check: most used outlines: " + ', '.join(f"{n} ({c})" for n, c in top))
+    return lines
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Write the collision pack TSV files from the stream file.")
     ap.add_argument('stream_bun', help="stream file (STREAML5RA.BUN)")
@@ -1080,6 +1240,9 @@ def main(argv=None):
     ap.add_argument('--region-bun', metavar='REGION',
                     help="region file (L5RA.BUN): with --match, loads the scenery groups so the "
                          "group numbers of the instances can be checked")
+    ap.add_argument('--troughs', metavar='TROUGHFILE',
+                    help="TroughBoundary.bin: tests whether the barrier walls follow the trough "
+                         "outlines")
     ap.add_argument('--min-rate', type=float, default=MIN_MATCH_RATE,
                     help=f"hit rate a matching method needs to be used (default {MIN_MATCH_RATE})")
     ap.add_argument('--obj', type=int, metavar='SECTION',
@@ -1125,6 +1288,11 @@ def main(argv=None):
             write_collision_obj(chosen[0], out / f"collision_section_{args.obj}.obj")
             print(f"[nfs_collision_pack] wrote collision_section_{args.obj}.obj")
 
+    if args.troughs:
+        from nfs_trough_boundary import load_trough_boundary
+        for line in barrier_trough_check(packs, load_trough_boundary(args.troughs)):
+            print(f"[nfs_collision_pack] {line}")
+
     if args.match:
         from nfs_stream_scenery import load_stream_scenery
         scenery = load_stream_scenery(args.stream_bun)
@@ -1133,9 +1301,29 @@ def main(argv=None):
         _group_links, group_reports = match_by_group(packs, scenery)
         for line in group_reports:
             print(f"[nfs_collision_pack] {line}")
-        _matches, reports = match_to_scenery(packs, scenery, args.min_rate)
+        diagnostics = []
+        _matches, reports = match_to_scenery(packs, scenery, args.min_rate, diagnostics)
         for line in reports:
             print(f"[nfs_collision_pack] {line}")
+        if diagnostics:
+            write_collision_geometry_tsv(diagnostics, out / 'collision_geometry.tsv')
+            counts = {}
+            bands = {}
+            for row in diagnostics:
+                status = row[8]
+                if status == 'no strips in the article':
+                    status += ' (edges: ' + ('yes' if row[4] else 'no') + ')'
+                key = (status, 'group' if row[2] else 'no group')
+                counts[key] = counts.get(key, 0) + 1
+                if row[8] == 'overlap below threshold':
+                    band = min(int(float(row[6]) * 10), 2) * 10
+                    bands[band] = bands.get(band, 0) + 1
+            print("[nfs_collision_pack] geometry result per instance, written to collision_geometry.tsv:")
+            for (status, group), count in sorted(counts.items(), key=lambda kv: -kv[1]):
+                print(f"  {count:>6}  {status}  ({group})")
+            if bands:
+                print("[nfs_collision_pack] best overlap of the 'overlap below threshold' instances: " +
+                      ', '.join(f"{band}-{band + 10}%: {count}" for band, count in sorted(bands.items())))
         _object_matches, reports = match_objects_to_scenery(packs, scenery, args.min_rate)
         for line in reports:
             print(f"[nfs_collision_pack] {line}")

@@ -2,7 +2,7 @@
 Small Tkinter viewer for Black Box NFS region files, across games.
 
 Layout:
-  File menu      Open region file, Open stream file, Open trough file, Clear
+  File menu      Open region file, Open stream file, Open trough file, Open collision file, Clear
                  stream data, Game (set it before you open a file), Exit
   Settings menu  Road network rotation (0/90/180/270, default 270). It turns
                  the road network nodes only; 270 is what lines them up with
@@ -42,6 +42,7 @@ _sys.path[:0] = [str(_pl.Path(__file__).resolve().parents[1] / _d) for _d in ['c
 import sys
 import json
 import colorsys
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -52,6 +53,7 @@ from nfs_region_common import format_section_label as _default_format_section_la
 from nfs_region_common import section_subsection
 from nfs_trackpath import ZONE_TYPES, STREAMER_PREDICTION
 from nfs_trough_boundary import load_trough_boundary
+from nfs_collision_pack import load_collision_packs, collision_drawables
 
 
 class RegionViewerApp(tk.Tk):
@@ -73,13 +75,14 @@ class RegionViewerApp(tk.Tk):
         self.dim_nondrivable = tk.BooleanVar(value=False)
         self.game = tk.StringVar(value=game if game in GAME_PARSERS else 'None')
         self.active_mode = tk.StringVar(value='sections')   # which layer owns the options row and the clicks
-        self.layer_order = ['sections', 'troughs', 'zones', 'nodes']   # bottom to top: the last one is drawn on top
+        self.layer_order = ['sections', 'troughs', 'collision', 'zones', 'nodes']   # bottom to top: the last one is drawn on top
         self.info_open = {}   # section info category -> open (True) or collapsed (False), kept between clicks
         self.layer_vars = {                                  # which layers are drawn
             'nodes': tk.BooleanVar(value=False),
             'sections': tk.BooleanVar(value=True),
             'zones': tk.BooleanVar(value=True),
             'troughs': tk.BooleanVar(value=True),
+            'collision': tk.BooleanVar(value=False),
         }
         self.road_rotation = tk.StringVar(value='270')
         self.show_road_width = tk.BooleanVar(value=True)
@@ -91,6 +94,9 @@ class RegionViewerApp(tk.Tk):
         self._dragged = False
         self._redraw_after_id = None
         self._road_chains = None  # cache: list of node-index lists, invalidated on file load
+        self._road_cache = None   # cache: rotated chain points, boxes, widths; rebuilt on a new file or rotation
+        self._boundary_boxes = {}  # cache: boundary ID -> (min x, min y, max x, max y), cleared on file load
+        self._outline_spacing = {}  # cache: id(point list) -> average segment length, cleared on file load
         self.selected_node_index = None
         self._overlap_clusters = None  # cache: {node_index: (rank, cluster_size)}, invalidated on file load
         self.show_zones = tk.BooleanVar(value=True)
@@ -104,6 +110,16 @@ class RegionViewerApp(tk.Tk):
         self.show_trough_labels = tk.BooleanVar(value=False)
         self.show_trough_holes = tk.BooleanVar(value=True)
         self.selected_troughs = set()    # trough indices under the last click
+        self.collision_pieces = None     # article boxes from the stream file's collision packs
+        self.collision_walls = None      # barrier edges (wall segments) from the same packs
+        self.collision_path = None
+        self.show_collision_pieces = tk.BooleanVar(value=True)
+        self.show_collision_walls = tk.BooleanVar(value=True)
+        self.show_collision_grouped_only = tk.BooleanVar(value=False)
+        self.selected_collision = None   # ('piece' or 'wall', index in that list)
+        self._collision_lines = []       # wall chains: (flat plane coords, has group, wall ids, box)
+        self._collision_line_grid = {}   # grid cell -> indexes of the wall chains that touch it
+        self._collision_piece_grid = {}  # grid cell -> indexes of the pieces that touch it
 
         self._build_ui()
 
@@ -111,9 +127,10 @@ class RegionViewerApp(tk.Tk):
             self.load_file(path)
 
     # ---------- UI ----------
-    MODES = [('nodes', 'Nodes'), ('sections', 'Sections'), ('zones', 'Zones'), ('troughs', 'Troughs')]
+    MODES = [('nodes', 'Nodes'), ('sections', 'Sections'), ('zones', 'Zones'), ('troughs', 'Troughs'),
+             ('collision', 'Collision')]
     MODE_TITLES = {'nodes': 'Node info', 'sections': 'Section info',
-                   'zones': 'Zone info', 'troughs': 'Trough info'}
+                   'zones': 'Zone info', 'troughs': 'Trough info', 'collision': 'Collision info'}
 
     def _build_ui(self):
         self._build_menus()
@@ -133,7 +150,11 @@ class RegionViewerApp(tk.Tk):
         self.stream_status_label = tk.Label(footer, text="No stream file loaded", anchor="w", fg="#888")
         self.stream_status_label.pack(side=tk.TOP, fill=tk.X, padx=6, pady=(0, 0))
         self.trough_status_label = tk.Label(footer, text="No trough file loaded", anchor="w", fg="#888")
-        self.trough_status_label.pack(side=tk.TOP, fill=tk.X, padx=6, pady=(0, 2))
+        self.trough_status_label.pack(side=tk.TOP, fill=tk.X, padx=6, pady=(0, 0))
+        self.collision_status_label = tk.Label(footer, text="No collision file loaded", anchor="w", fg="#888")
+        self.collision_status_label.pack(side=tk.TOP, fill=tk.X, padx=6, pady=(0, 0))
+        self.perf_label = tk.Label(footer, text="", anchor="e", fg="#888")
+        self.perf_label.pack(side=tk.TOP, fill=tk.X, padx=6, pady=(0, 2))
 
         self._build_viewer_tab(viewer_tab)
         self._build_export_tab(export_tab)
@@ -146,6 +167,7 @@ class RegionViewerApp(tk.Tk):
         file_menu.add_command(label="Open region file...", command=self.open_dialog)
         file_menu.add_command(label="Open stream file...", command=self.open_stream_dialog)
         file_menu.add_command(label="Open trough file...", command=self.open_trough_dialog)
+        file_menu.add_command(label="Open collision file (stream)...", command=self.open_collision_dialog)
         file_menu.add_separator()
         file_menu.add_command(label="Clear stream data", command=self.clear_stream_data)
         file_menu.add_separator()
@@ -230,6 +252,14 @@ class RegionViewerApp(tk.Tk):
         tk.Checkbutton(troughs_row, text="Show holes", variable=self.show_trough_holes,
                         command=self.redraw).pack(side=tk.LEFT, padx=8)
 
+        collision_row = self.mode_options['collision']
+        tk.Checkbutton(collision_row, text="Pieces (article boxes)", variable=self.show_collision_pieces,
+                        command=self.redraw).pack(side=tk.LEFT, padx=8, pady=2)
+        tk.Checkbutton(collision_row, text="Walls (barrier edges)", variable=self.show_collision_walls,
+                        command=self.redraw).pack(side=tk.LEFT, padx=8)
+        tk.Checkbutton(collision_row, text="Only with a group number", variable=self.show_collision_grouped_only,
+                        command=self.redraw).pack(side=tk.LEFT, padx=8)
+
         body = tk.Frame(parent)
         body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
@@ -286,6 +316,7 @@ class RegionViewerApp(tk.Tk):
         self.selected_zones = set()
         self.selected_barriers = set()
         self.selected_troughs = set()
+        self.selected_collision = None
         self._show_hint(mode)
         self.redraw()
 
@@ -298,6 +329,9 @@ class RegionViewerApp(tk.Tk):
                       else "Click a road node to inspect it."),
             'zones': "Click a zone or barrier.",
             'troughs': "Click inside a trough outline.",
+            'collision': ("Open the stream file with File > Open collision file." if not self.collision_pieces
+                          else "Click a wall or a piece. Orange pieces have strips, red walls have a "
+                               "group number, cyan walls have none."),
         }
         self.info_text.config(state="normal")
         self.info_text.delete("1.0", tk.END)
@@ -354,6 +388,9 @@ class RegionViewerApp(tk.Tk):
         self.selected_id = None
         self.selected_node_index = None
         self._road_chains = None
+        self._road_cache = None
+        self._boundary_boxes = {}
+        self._outline_spacing = {}
         self._overlap_clusters = None
         self.selected_zones = set()
         self.selected_barriers = set()
@@ -428,6 +465,31 @@ class RegionViewerApp(tk.Tk):
         self.trough_status_label.config(text=f"Troughs: {loaded.summary()}", fg="#000000")
         self.redraw()
 
+    def open_collision_dialog(self):
+        path = filedialog.askopenfilename(
+            title="Open the stream file with the collision packs (e.g. STREAML5RA)",
+            filetypes=[("Stream bundle", "*.bun *.BUN"), ("All files", "*.*")])
+        if path:
+            self.load_collision_file(path)
+
+    def load_collision_file(self, path):
+        try:
+            packs = load_collision_packs(path)
+            pieces, walls = collision_drawables(packs)
+        except Exception as e:
+            messagebox.showerror("Failed to read collision packs", str(e))
+            return
+        self.collision_pieces = pieces
+        self.collision_walls = walls
+        self.collision_path = path
+        self.selected_collision = None
+        self._build_collision_index()
+        self.collision_status_label.config(
+            text=f"Collision: {len(packs)} pack(s), {len(pieces)} piece(s) with strips, "
+                 f"{len(walls)} wall(s)", fg="#000000")
+        self.layer_vars['collision'].set(True)
+        self.redraw()
+
     def clear_stream_data(self):
         self.stream_scenery = None
         self.stream_path = None
@@ -473,6 +535,11 @@ class RegionViewerApp(tk.Tk):
             for polygon in self.troughs.polygons:
                 xs += [polygon.bbox_min[0], polygon.bbox_max[0]]
                 ys += [polygon.bbox_min[1], polygon.bbox_max[1]]
+        if 'collision' in layers and self.collision_pieces:
+            # game (x, z) goes to the plane of the section boundaries as (z, -x)
+            for piece in self.collision_pieces:
+                xs += [piece[7], piece[9]]
+                ys += [-piece[6], -piece[8]]
         return xs, ys
 
     def _boundary_points(self):
@@ -552,18 +619,25 @@ class RegionViewerApp(tk.Tk):
 
     # ---------- Drawing ----------
     def redraw(self):
+        started = time.perf_counter()
         self.canvas.delete("all")
         if not self.world:
             return
         draw = {
             'sections': self._redraw_boundaries,
             'troughs': self._redraw_troughs,
+            'collision': self._redraw_collision,
             'zones': self._redraw_track_paths,
             'nodes': self._redraw_road_network,
         }
+        timings = []
         for key in self.layer_order:   # bottom first, so the last layer ends up on top
             if self.layer_vars[key].get():
+                layer_started = time.perf_counter()
                 draw[key]()
+                timings.append(f"{key} {(time.perf_counter() - layer_started) * 1000:.0f}")
+        self.perf_label.config(text=f"redraw {(time.perf_counter() - started) * 1000:.0f} ms "
+                                    f"({', '.join(timings)}), {len(self.canvas.find_all())} canvas items")
 
     def _node_half_width(self, rn, node):
         """Half of the node's profile total_width(), or None if this node
@@ -581,6 +655,14 @@ class RegionViewerApp(tk.Tk):
         return profile.total_width() / 2.0
 
     def _draw_road_strip_chain(self, rn, chain, canvas_pts, fill_color="#204060"):
+        """Ribbon for a whole chain; see _draw_road_strip_run."""
+        half_widths = [self._node_half_width(rn, rn.nodes[i]) for i in chain]
+        if all(hw is None for hw in half_widths):
+            return
+        self._draw_road_strip_run([hw if hw is not None else 0.0 for hw in half_widths],
+                                  canvas_pts, fill_color)
+
+    def _draw_road_strip_run(self, half_widths, canvas_pts, fill_color="#204060"):
         """Fills one ribbon polygon along the whole chain, using each node's
         profile half-width offset perpendicular to a central-difference
         tangent at that node - the same idea as the centerline's smoothing,
@@ -595,11 +677,9 @@ class RegionViewerApp(tk.Tk):
         polygon outline, so the ribbon's ends come out slightly rounded
         rather than perfectly flat - a cosmetic side effect of reusing
         Tkinter's built-in polygon smoothing instead of hand-rolling it."""
-        half_widths = [self._node_half_width(rn, rn.nodes[i]) for i in chain]
-        if all(hw is None for hw in half_widths):
-            return
-        half_widths = [hw if hw is not None else 0.0 for hw in half_widths]
         n = len(canvas_pts)
+        if n < 2:
+            return
         left_pts, right_pts = [], []
         for i in range(n):
             if i == 0:
@@ -620,9 +700,45 @@ class RegionViewerApp(tk.Tk):
             coords.extend(pt)
         for pt in reversed(right_pts):
             coords.extend(pt)
-        smooth = n > 2
+        smooth = 2 < n <= 300
         self.canvas.create_polygon(coords, fill=fill_color, outline="",
-                                    smooth=smooth, splinesteps=12 if smooth else 1)
+                                    smooth=smooth, splinesteps=8 if smooth else 1)
+
+    def _road_geometry(self, rn):
+        """Per file and per rotation, kept between redraws: the rotated plane position of every
+        node, and for every chain its points, box, half widths and colours. Without it each
+        redraw rotated every node, looked up every profile and mixed every colour again."""
+        deg = self.road_rotation.get()
+        cache = self._road_cache
+        if cache is not None and cache['rn'] is rn and cache['deg'] == deg:
+            return cache
+        if self._road_chains is None:
+            self._road_chains = self._trace_road_chains(rn)
+        if self._overlap_clusters is None:
+            self._overlap_clusters = self._find_overlap_clusters(rn)
+        node_xy = [self._rotate_xy(n.position[0], n.position[2]) for n in rn.nodes]
+        chains = []
+        for chain in self._road_chains:
+            xy = [node_xy[i] for i in chain]
+            xs, ys = [p[0] for p in xy], [p[1] for p in xy]
+            half = [self._node_half_width(rn, rn.nodes[i]) for i in chain]
+            if all(h is None for h in half):
+                half = None
+            else:
+                half = [h if h is not None else 0.0 for h in half]
+            # A chain that touches an overlap cluster takes the colour of its highest rank, so a
+            # whole overpass ramp reads as elevated and not only its end dot.
+            overlap_ts = [self._overlap_clusters[i][0] / (self._overlap_clusters[i][1] - 1)
+                          for i in chain if i in self._overlap_clusters and self._overlap_clusters[i][1] > 1]
+            if overlap_ts:
+                line_color = self._lerp_color("#40a0ff", "#ff6040", max(overlap_ts))
+                fill_color = self._lerp_color("#204060", "#803010", max(overlap_ts))
+            else:
+                line_color, fill_color = "#40c0ff", "#204060"
+            chains.append((xy, (min(xs), min(ys), max(xs), max(ys)), half, line_color, fill_color))
+        cache = {'rn': rn, 'deg': deg, 'node_xy': node_xy, 'chains': chains}
+        self._road_cache = cache
+        return cache
 
     def _trace_road_chains(self, rn):
         """Groups connected road segments into maximal polylines (as lists of
@@ -752,65 +868,67 @@ class RegionViewerApp(tk.Tk):
                 20, 20, anchor="nw", fill="#888",
                 text="No road network (CarpWorldGrid) found in this file.")
             return
-        if self._road_chains is None:
-            self._road_chains = self._trace_road_chains(rn)
-        if self._overlap_clusters is None:
-            self._overlap_clusters = self._find_overlap_clusters(rn)
-
+        geometry = self._road_geometry(rn)
+        node_xy = geometry['node_xy']
         vx0, vy0, vx1, vy1 = self._visible_world_bounds()
         show_width = self.show_road_width.get()
-        nodes = rn.nodes
+        scale, off_x, off_y = self.scale, self.offset_x, self.offset_y
 
-        # Road-width strips are drawn per whole chain (one ribbon polygon,
-        # see _draw_road_strip_chain) so they curve the same way the
-        # centerline does, then the centerline itself on top of that.
-        for chain in self._road_chains:
-            pts_world = [self._rotate_xy(nodes[i].position[0], nodes[i].position[2]) for i in chain]
-            cxs, cys = [p[0] for p in pts_world], [p[1] for p in pts_world]
-            if max(cxs) < vx0 or min(cxs) > vx1 or max(cys) < vy0 or min(cys) > vy1:
+        # Per chain: only the runs of points that are in view (plus the point on each side, so a
+        # line still enters and leaves the screen), and no point closer than 2 pixels to the
+        # last one. The ribbon uses the same points, so it matches the centre line.
+        for xy, (bx0, by0, bx1, by1), half, line_color, fill_color in geometry['chains']:
+            if bx1 < vx0 or bx0 > vx1 or by1 < vy0 or by0 > vy1:
                 continue  # whole chain is off-screen, skip it entirely
-            canvas_pts = [self.world_to_canvas(x, y) for x, y in pts_world]
+            count = len(xy)
+            keep = [False] * count
+            for i in range(count - 1):
+                ax, ay = xy[i]
+                bx, by = xy[i + 1]
+                if min(ax, bx) <= vx1 and max(ax, bx) >= vx0 and min(ay, by) <= vy1 and max(ay, by) >= vy0:
+                    keep[i] = keep[i + 1] = True
+            i = 0
+            while i < count:
+                if not keep[i]:
+                    i += 1
+                    continue
+                j = i
+                while j < count and keep[j]:
+                    j += 1
+                run = list(range(i, j))   # indexes into the chain
+                i = j
+                if len(run) < 2:
+                    continue
+                picked, pts = [], []
+                last_x = last_y = None
+                for k in run:
+                    cx = off_x + xy[k][0] * scale
+                    cy = off_y - xy[k][1] * scale
+                    if last_x is None or k == run[-1] or abs(cx - last_x) + abs(cy - last_y) >= 2.0:
+                        picked.append(k)
+                        pts.append((cx, cy))
+                        last_x, last_y = cx, cy
+                if len(pts) < 2:
+                    continue
+                if show_width and half is not None:
+                    self._draw_road_strip_run([half[k] for k in picked], pts, fill_color)
+                flat = [c for pt in pts for c in pt]
+                if 2 < len(pts) <= 300:
+                    self.canvas.create_line(*flat, fill=line_color, width=2, smooth=True, splinesteps=8)
+                else:
+                    self.canvas.create_line(*flat, fill=line_color, width=2)
 
-            # If any node on this chain is part of an overlap cluster, color
-            # the whole chain (fill + centerline) with the same blue->orange
-            # gradient used on the node markers, by that node's rank - so an
-            # entire overpass ramp reads as "elevated" at a glance instead of
-            # only its endpoint dots. When a chain touches more than one
-            # overlap node (rare), the highest rank found wins, since that's
-            # the more attention-worthy end of the ambiguity.
-            overlap_ts = [self._overlap_clusters[i][0] / (self._overlap_clusters[i][1] - 1)
-                          for i in chain if i in self._overlap_clusters and self._overlap_clusters[i][1] > 1]
-            if overlap_ts:
-                line_color = self._lerp_color("#40a0ff", "#ff6040", max(overlap_ts))
-                fill_color = self._lerp_color("#204060", "#803010", max(overlap_ts))
-            else:
-                line_color, fill_color = "#40c0ff", "#204060"
-
-            if show_width:
-                self._draw_road_strip_chain(rn, chain, canvas_pts, fill_color)
-            flat = [c for pt in canvas_pts for c in pt]
-            if len(chain) > 2:
-                self.canvas.create_line(*flat, fill=line_color, width=2,
-                                         smooth=True, splinesteps=12)
-            else:
-                self.canvas.create_line(*flat, fill=line_color, width=2)
-
-        # Node markers: skip drawing them once there are enough on screen
-        # that individual create_oval calls would dominate redraw time - the
-        # smoothed chain lines already show the network shape at that point.
-        # Indices are tracked (not just positions) so the selected node can
-        # be found again and always drawn, even past that cap.
-        visible = []
-        for i, n in enumerate(nodes):
-            wx, wy = self._rotate_xy(n.position[0], n.position[2])
-            if vx0 <= wx <= vx1 and vy0 <= wy <= vy1:
-                visible.append(i)
-        draw_all = len(visible) <= 4000
+        # Node markers: skip drawing them once there are enough on screen that individual
+        # create_oval calls would dominate redraw time - the chain lines already show the
+        # network shape at that point. Indices are tracked (not just positions) so the
+        # selected node can be found again and always drawn, even past that cap.
+        visible = [i for i, (wx, wy) in enumerate(node_xy) if vx0 <= wx <= vx1 and vy0 <= wy <= vy1]
+        draw_all = len(visible) <= 2500
         for i in visible:
             overlap = self._overlap_clusters.get(i)
             if not draw_all and i != self.selected_node_index and overlap is None:
                 continue  # overlap-cluster nodes stay visible past the cap too - that's the point
-            cx, cy = self.world_to_canvas(*self._rotate_xy(nodes[i].position[0], nodes[i].position[2]))
+            cx, cy = self.world_to_canvas(*node_xy[i])
             selected = (i == self.selected_node_index)
             if selected:
                 r, color = 4, "#ffe000"
@@ -833,6 +951,76 @@ class RegionViewerApp(tk.Tk):
         r, g, b = colorsys.hsv_to_rgb(idx / 20.0, 0.6, 0.95)
         return f"#{int(r * 255):02x}{int(g * 255):02x}{int(b * 255):02x}"
 
+    def _draw_decimated_line(self, run, color, width, tags=()):
+        """One canvas line through the plane points of run: no point closer than 2 pixels to the last
+        one is kept (the first and last always are)."""
+        scale, off_x, off_y = self.scale, self.offset_x, self.offset_y
+        out = []
+        last_x = last_y = None
+        end = len(run) - 1
+        for k, (x, y) in enumerate(run):
+            cx = off_x + x * scale
+            cy = off_y - y * scale
+            if last_x is None or k == end or abs(cx - last_x) + abs(cy - last_y) >= 2.0:
+                out.append(cx)
+                out.append(cy)
+                last_x, last_y = cx, cy
+        if len(out) >= 4:
+            self.canvas.create_line(*out, fill=color, width=width, tags=tags)
+
+    def _draw_outline(self, points, bounds, color, width=1, closed=True, tags=(), box=None):
+        """Draws a polygon or polyline outline of plane points, only where it is in view.
+        - box (min x, min y, max x, max y) of the outline, when the caller has it: an outline that
+          lies fully in view is drawn in one pass without testing its segments.
+        - Dense outlines use every Nth point, N chosen so segments stay about 2 pixels long at
+          this zoom (at most 32), because shorter ones cannot be seen.
+        - Otherwise a segment counts as in view when its box meets the view bounds; runs of such
+          segments become one canvas line each, so a long outline that is mostly off screen costs
+          about what its visible part does."""
+        n = len(points)
+        if n < 2:
+            return
+        vx0, vy0, vx1, vy1 = bounds
+        spacing = self._outline_spacing.get(id(points))
+        if spacing is None:
+            total = 0.0
+            for i in range(n - 1):
+                total += abs(points[i + 1][0] - points[i][0]) + abs(points[i + 1][1] - points[i][1])
+            spacing = self._outline_spacing[id(points)] = max(total / (n - 1), 1e-6)
+        step = int(2.0 / (spacing * self.scale)) if spacing * self.scale < 2.0 else 1
+        step = max(1, min(step, 32))
+        if step > 1 and n // step >= 4:
+            points = points[::step]
+            n = len(points)
+        if box is not None and vx0 <= box[0] and box[2] <= vx1 and vy0 <= box[1] and box[3] <= vy1:
+            self._draw_decimated_line(list(points) + [points[0]] if closed else points, color, width, tags)
+            return
+        segments = n if closed else n - 1
+        i = 0
+        while i < segments:
+            ax, ay = points[i]
+            bx, by = points[(i + 1) % n]
+            if not (min(ax, bx) <= vx1 and max(ax, bx) >= vx0 and min(ay, by) <= vy1 and max(ay, by) >= vy0):
+                i += 1
+                continue
+            j = i + 1
+            while j < segments:
+                ax, ay = points[j]
+                bx, by = points[(j + 1) % n]
+                if not (min(ax, bx) <= vx1 and max(ax, bx) >= vx0 and min(ay, by) <= vy1 and max(ay, by) >= vy0):
+                    break
+                j += 1
+            self._draw_decimated_line([points[k % n] for k in range(i, j + 1)], color, width, tags)
+            i = j
+
+    def _boundary_box(self, b):
+        box = self._boundary_boxes.get(b.ID)
+        if box is None and b.points:
+            xs = [p[0] for p in b.points]
+            ys = [p[1] for p in b.points]
+            box = self._boundary_boxes[b.ID] = (min(xs), min(ys), max(xs), max(ys))
+        return box
+
     def _redraw_boundaries(self):
         vx0, vy0, vx1, vy1 = self._visible_world_bounds()
 
@@ -854,17 +1042,12 @@ class RegionViewerApp(tk.Tk):
                     self.canvas.create_line(ax, ay, bx, by, fill="#c04cff", width=1)
 
         show_labels = self.show_labels.get()
+        bounds = (vx0, vy0, vx1, vy1)
         for b in self.world.boundaries:
-            xs = [p[0] for p in b.points]
-            ys = [p[1] for p in b.points]
-            if not xs or not self._bbox_intersects(min(xs), min(ys), max(xs), max(ys),
-                                                     vx0, vy0, vx1, vy1):
+            box = self._boundary_box(b)
+            if box is None or not self._bbox_intersects(*box, vx0, vy0, vx1, vy1):
                 continue
-            coords = []
-            for (x, y) in b.points:
-                cx, cy = self.world_to_canvas(x, y)
-                coords.extend([cx, cy])
-            if len(coords) < 6:
+            if len(b.points) < 3:
                 continue
             selected = (b.ID == self.selected_id)
             highlighted = (b.ID in self.highlighted_ids)
@@ -879,8 +1062,7 @@ class RegionViewerApp(tk.Tk):
             if self.dim_nondrivable.get() and not selected and self.world.is_drivable(b.ID) is False:
                 outline = "#404040"
             width = 3 if (selected or highlighted) else 1
-            self.canvas.create_polygon(coords, outline=outline, fill="", width=width,
-                                        tags=(f"boundary_{b.ID}",))
+            self._draw_outline(b.points, bounds, outline, width, True, (f"boundary_{b.ID}",), box)
             if show_labels:
                 lx, ly = self.world_to_canvas(*b.pos)
                 label = f"{self.section_letter(b.ID)}{b.ID}"
@@ -889,22 +1071,207 @@ class RegionViewerApp(tk.Tk):
                                          tags=(f"boundary_{b.ID}",))
 
     # ---------- Troughs (TroughBoundary.bin) ----------
+    _COLLISION_CELL = 128.0   # world units per grid cell of the collision index
+    _COLLISION_CHUNK = 40     # wall segments per drawn chain: long outlines are cut so a view only draws what it needs
+
+    def _build_collision_index(self):
+        """Joins walls that follow each other (the end of one is the start of the next, same
+        instance and group) into chains of at most _COLLISION_CHUNK segments, so one canvas
+        line replaces dozens, and puts the chains and the pieces in a grid so a redraw looks
+        only at the cells in view. Points are stored in the plane of the other layers,
+        (z, -x) of the game coordinates."""
+        cell = self._COLLISION_CELL
+        walls = self.collision_walls or []
+        lines = []
+        state = {'coords': None, 'ids': None, 'key': None}
+
+        def flush():
+            coords = state['coords']
+            if coords is not None and len(coords) >= 4:
+                xs, ys = coords[0::2], coords[1::2]
+                lines.append((coords, state['key'][2], state['ids'], (min(xs), min(ys), max(xs), max(ys))))
+
+        for wall_id, w in enumerate(walls):
+            ax, ay, bx, by = w[4], -w[3], w[6], -w[5]
+            key = (w[0], w[1], bool(w[2]))
+            coords = state['coords']
+            if (coords is not None and key == state['key'] and len(state['ids']) < self._COLLISION_CHUNK
+                    and abs(coords[-2] - ax) < 0.05 and abs(coords[-1] - ay) < 0.05):
+                coords.extend((bx, by))
+                state['ids'].append(wall_id)
+            else:
+                flush()
+                state['coords'], state['ids'], state['key'] = [ax, ay, bx, by], [wall_id], key
+        flush()
+
+        line_grid = {}
+        for i, line in enumerate(lines):
+            x0, y0, x1, y1 = line[3]
+            for gx in range(int(x0 // cell), int(x1 // cell) + 1):
+                for gy in range(int(y0 // cell), int(y1 // cell) + 1):
+                    line_grid.setdefault((gx, gy), []).append(i)
+        piece_grid = {}
+        for i, piece in enumerate(self.collision_pieces or []):
+            x0, y0, x1, y1 = piece[7], -piece[8], piece[9], -piece[6]
+            for gx in range(int(x0 // cell), int(x1 // cell) + 1):
+                for gy in range(int(y0 // cell), int(y1 // cell) + 1):
+                    piece_grid.setdefault((gx, gy), []).append(i)
+        self._collision_lines = lines
+        self._collision_line_grid = line_grid
+        self._collision_piece_grid = piece_grid
+
+    def _collision_candidates(self, grid, x0, y0, x1, y1):
+        """Indexes from the grid cells that touch the world rectangle, each once."""
+        cell = self._COLLISION_CELL
+        gx0, gx1, gy0, gy1 = int(x0 // cell), int(x1 // cell), int(y0 // cell), int(y1 // cell)
+        if (gx1 - gx0 + 1) * (gy1 - gy0 + 1) > len(grid):
+            keys = [k for k in grid if gx0 <= k[0] <= gx1 and gy0 <= k[1] <= gy1]
+        else:
+            keys = [(gx, gy) for gx in range(gx0, gx1 + 1) for gy in range(gy0, gy1 + 1)]
+        seen = set()
+        for key in keys:
+            for i in grid.get(key, ()):
+                if i not in seen:
+                    seen.add(i)
+                    yield i
+
+    def _redraw_collision(self):
+        """Pieces are the boxes of articles with strips, walls the barrier edges, drawn as chains.
+        Only the grid cells in view are looked at, chains smaller than a pixel are skipped, and
+        points closer than 2 pixels to the last one are dropped."""
+        if not self.collision_pieces and not self.collision_walls:
+            return
+        vx0, vy0, vx1, vy1 = self._visible_world_bounds()
+        grouped_only = self.show_collision_grouped_only.get()
+        scale, off_x, off_y = self.scale, self.offset_x, self.offset_y
+        if self.show_collision_pieces.get():
+            for i in self._collision_candidates(self._collision_piece_grid, vx0, vy0, vx1, vy1):
+                piece = self.collision_pieces[i]
+                if grouped_only and not piece[2]:
+                    continue
+                x0, y0, x1, y1 = piece[7], -piece[8], piece[9], -piece[6]
+                if (x1 - x0) * scale < 2 and (y1 - y0) * scale < 2:
+                    continue
+                if not self._bbox_intersects(x0, y0, x1, y1, vx0, vy0, vx1, vy1):
+                    continue
+                self.canvas.create_rectangle(off_x + x0 * scale, off_y - y0 * scale,
+                                              off_x + x1 * scale, off_y - y1 * scale,
+                                              outline="#d08020")
+        if self.show_collision_walls.get():
+            for i in self._collision_candidates(self._collision_line_grid, vx0, vy0, vx1, vy1):
+                coords, has_group, _ids, (x0, y0, x1, y1) = self._collision_lines[i]
+                if grouped_only and not has_group:
+                    continue
+                if (x1 - x0) * scale < 1.5 and (y1 - y0) * scale < 1.5:
+                    continue
+                if not self._bbox_intersects(x0, y0, x1, y1, vx0, vy0, vx1, vy1):
+                    continue
+                out = []
+                last_x = last_y = None
+                count = len(coords)
+                # Short segments cannot be seen: take every Nth point so they stay about 2 pixels long.
+                spacing = max(x1 - x0, y1 - y0) / len(_ids)
+                step = 1 if spacing * scale >= 2.0 else max(1, min(int(2.0 / max(spacing * scale, 1e-9)), len(_ids) // 2 or 1))
+                indexes = list(range(0, count, 2 * step))
+                if indexes[-1] != count - 2:
+                    indexes.append(count - 2)
+                for k in indexes:
+                    cx = off_x + coords[k] * scale
+                    cy = off_y - coords[k + 1] * scale
+                    if last_x is None or k == count - 2 or abs(cx - last_x) + abs(cy - last_y) >= 2.0:
+                        out.append(cx)
+                        out.append(cy)
+                        last_x, last_y = cx, cy
+                if len(out) >= 4:
+                    self.canvas.create_line(*out, fill="#ff4040" if has_group else "#30c0ff")
+        selected = self.selected_collision
+        if selected and selected[0] == 'wall':
+            w = self.collision_walls[selected[1]]
+            ax, ay = self.world_to_canvas(w[4], -w[3])
+            bx, by = self.world_to_canvas(w[6], -w[5])
+            self.canvas.create_line(ax, ay, bx, by, fill="#ffffff", width=3)
+        elif selected and selected[0] == 'piece':
+            p = self.collision_pieces[selected[1]]
+            ax, ay = self.world_to_canvas(p[7], -p[8])
+            bx, by = self.world_to_canvas(p[9], -p[6])
+            self.canvas.create_rectangle(ax, ay, bx, by, outline="#ffffff", width=2)
+
+    def _select_collision_at(self, cx, cy):
+        """Picks the nearest wall within 6 pixels, else the smallest piece box under the click."""
+        self.selected_collision = None
+        if not self.collision_pieces and not self.collision_walls:
+            self._show_hint('collision')
+            return
+        wx, wy = self.canvas_to_world(cx, cy)
+        tolerance = 6.0 / self.scale
+        grouped_only = self.show_collision_grouped_only.get()
+        best = None
+        if self.show_collision_walls.get():
+            for i in self._collision_candidates(self._collision_line_grid, wx - tolerance, wy - tolerance,
+                                                 wx + tolerance, wy + tolerance):
+                coords, has_group, ids, (bx0, by0, bx1, by1) = self._collision_lines[i]
+                if grouped_only and not has_group:
+                    continue
+                if bx0 - tolerance > wx or bx1 + tolerance < wx or by0 - tolerance > wy or by1 + tolerance < wy:
+                    continue
+                for k, wall_id in enumerate(ids):
+                    x0, y0, x1, y1 = coords[2 * k], coords[2 * k + 1], coords[2 * k + 2], coords[2 * k + 3]
+                    dx, dy = x1 - x0, y1 - y0
+                    length_sq = dx * dx + dy * dy
+                    t = 0.0 if length_sq == 0 else max(0.0, min(1.0, ((wx - x0) * dx + (wy - y0) * dy) / length_sq))
+                    d = ((wx - (x0 + t * dx)) ** 2 + (wy - (y0 + t * dy)) ** 2) ** 0.5
+                    if d <= tolerance and (best is None or d < best[0]):
+                        best = (d, 'wall', wall_id)
+        if best is None and self.show_collision_pieces.get():
+            smallest = None
+            for i in self._collision_candidates(self._collision_piece_grid, wx, wy, wx, wy):
+                piece = self.collision_pieces[i]
+                if grouped_only and not piece[2]:
+                    continue
+                x0, y0, x1, y1 = piece[7], -piece[8], piece[9], -piece[6]
+                if x0 <= wx <= x1 and y0 <= wy <= y1:
+                    area = (x1 - x0) * (y1 - y0)
+                    if smallest is None or area < smallest[0]:
+                        smallest = (area, i)
+            if smallest:
+                best = (0.0, 'piece', smallest[1])
+        if best is None:
+            self._show_hint('collision')
+            return
+        kind, index = best[1], best[2]
+        self.selected_collision = (kind, index)
+        if kind == 'wall':
+            w = self.collision_walls[index]
+            length = ((w[5] - w[3]) ** 2 + (w[6] - w[4]) ** 2) ** 0.5
+            lines = ["Wall (barrier edge)", f"section {w[0]}, instance {w[1]}",
+                     f"group number: {w[2] if w[2] else 'none'}",
+                     f"from game x,z ({w[3]:.1f}, {w[4]:.1f}) to ({w[5]:.1f}, {w[6]:.1f})",
+                     f"length {length:.1f}, height from {w[7]:.1f} to {w[8]:.1f}"]
+        else:
+            p = self.collision_pieces[index]
+            lines = ["Piece (article with strips)", f"section {p[0]}, instance {p[1]}",
+                     f"group number: {p[2] if p[2] else 'none'}",
+                     f"strips {p[3]}, triangles {p[5]}, edges {p[4]}",
+                     f"box game x {p[6]:.1f} .. {p[8]:.1f}, z {p[7]:.1f} .. {p[9]:.1f}"]
+        self.info_text.config(state="normal")
+        self.info_text.delete("1.0", tk.END)
+        self.info_text.insert(tk.END, "\n".join(lines))
+        self.info_text.config(state="disabled")
+
     def _redraw_troughs(self):
         if not self.troughs:
             return
         vx0, vy0, vx1, vy1 = self._visible_world_bounds()
         show_labels = self.show_trough_labels.get()
         show_holes = self.show_trough_holes.get()
+        bounds = (vx0, vy0, vx1, vy1)
         for p in self.troughs.polygons:
             if p.is_hole and not show_holes:
                 continue
             if not self._bbox_intersects(p.bbox_min[0], p.bbox_min[1], p.bbox_max[0], p.bbox_max[1],
                                           vx0, vy0, vx1, vy1):
                 continue
-            coords = []
-            for (x, y) in p.points:
-                coords.extend(self.world_to_canvas(x, y))
-            if len(coords) < 6:
+            if len(p.points) < 3:
                 continue
             if p.index in self.selected_troughs:
                 color, width = "#ffffff", 3
@@ -912,7 +1279,8 @@ class RegionViewerApp(tk.Tk):
                 color, width = "#ff6060", 1
             else:
                 color, width = "#30d0a0", 1
-            self.canvas.create_polygon(coords, outline=color, fill="", width=width)
+            self._draw_outline(p.points, bounds, color, width, True, (),
+                               (p.bbox_min[0], p.bbox_min[1], p.bbox_max[0], p.bbox_max[1]))
             if show_labels:
                 lx, ly = self.world_to_canvas((p.bbox_min[0] + p.bbox_max[0]) / 2,
                                               (p.bbox_min[1] + p.bbox_max[1]) / 2)
@@ -1005,10 +1373,7 @@ class RegionViewerApp(tk.Tk):
                 color = "#ffffff" if selected else self._zone_color(z.type)
                 width = 3 if selected else 2
                 if z.num_points >= 3:
-                    coords = []
-                    for (x, y) in z.points:
-                        coords.extend(self.world_to_canvas(x, y))
-                    self.canvas.create_polygon(coords, outline=color, fill="", width=width)
+                    self._draw_outline(z.points, (vx0, vy0, vx1, vy1), color, width, True)
                 elif z.num_points == 2:
                     a = self.world_to_canvas(*z.points[0])
                     b = self.world_to_canvas(*z.points[1])
@@ -1404,6 +1769,10 @@ class RegionViewerApp(tk.Tk):
             self.selected_id = None
             self.selected_node_index = None
             self._append_trough_info(cx, cy)
+        elif mode == 'collision':
+            self.selected_id = None
+            self.selected_node_index = None
+            self._select_collision_at(cx, cy)
         else:
             wx, wy = self.canvas_to_world(cx, cy)
             hit = None

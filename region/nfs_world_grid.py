@@ -4,6 +4,15 @@ child CDat. The MW decomp (WGrid::Init in World/Common/WGrid.cpp) reads it as:
     CDat
         CGrd   the grid: WGrid, 0x20 bytes used
         CGcn   the grid nodes, back to back (WGridNode, walked with TotalSize())
+In Carbon the CGrd block is 0x28 bytes (Hyperlinked grid::manager: the WGrid fields, then
+the node pointer and two flags) and the region file holds NO nodes. Its CDat holds one
+'cl' block per island instead, 10 bytes: u16 section number, origin row, origin col,
+width, height (Hyperlinked grid::island). The nodes sit in the stream file, one chunk
+0x0003B802 (BCHUNK_CARP_WGRID_ISLAND_DATA, "world_grid_maker" in Hyperlinked) per island,
+a CARP with CGcn blocks. The node header is the same 0x14 bytes, with the pad field read
+as the island (Hyperlinked grid::node). Whether the node index of an island is global or
+local to the island is decided from the data, per island: an index past width * height
+can only be global.
 The game finds every static collision instance through this grid: a query turns a point
 and a radius into grid nodes (x and z, FindNodes), and each node lists the instances it
 touches. So the grid, not the scenery, says where a collision instance applies.
@@ -14,7 +23,8 @@ WGrid (World/Common/WGrid.h):
     node index = row * fNumCols + col; col = (x - min x) / edge, row = (z - min z) / edge
 WGridNode (World/Common/WGridNode.h), header size = pointer size + 16:
     +0x00 fDynElems pointer (zero on disk), 4 bytes in a 32 bit build
-    +P+0  fNodeInd u16   +P+2 pad u16   +P+4 fElemCounts u8[4]   +P+8 fElemOffsets u16[4]
+    +P+0  fNodeInd u16   +P+2 pad u16 (island in Carbon)   +P+4 fElemCounts u8[4]
+    +P+8 fElemOffsets u16[4]
     then the element lists: u32 each, list t at (end of the header + offset t),
     fElemCounts[t] entries. TotalSize = header + 4 * sum(counts).
 Element types: 0 instance, 1 trigger, 2 object, 3 road segment.
@@ -22,8 +32,9 @@ An instance element is a global index: section number in the high 16 bits, index
 that section's collision pack in the low 16 bits (WCollisionAssets::Instance).
 
 NOT CHECKED on a real file: the pointer size (4 or 8; this reader tries both and keeps
-the one whose nodes end exactly at the end of the block), the meaning of the 'Map'
-child, and whether a file has more than one CGcn block. Run it and read the check lines.
+the one whose nodes end exactly at the end of the block), the header of the 0x3B802 chunk
+(tried with and without the 16 byte CARP header), and the local or global node index.
+Run it and read the check lines.
 """
 # stream bootstrap: make the shared library folders importable
 import pathlib as _pl, sys as _sys
@@ -38,22 +49,26 @@ from nfs_carp_parser import find_carp_offset, parse_carp, TAG_CDAT, TAG_CGRD, _t
 TOOL_NAME = 'nfs_world_grid'
 
 TAG_CGCN = _tag_to_int('CGcn')
+TAG_CL = 0x636C0000                                # 'cl', the low 16 bits are a block number
+TAG_MASK = 0xFFFF0000
+ISLAND_CHUNK_ID = (0x0003B802).to_bytes(4, 'little')
 ELEMENT_NAMES = ('instance', 'trigger', 'object', 'road_segment')
 GRID_HEADER_SIZE = 0x20
 POINTER_SIZES = (4, 8)
 
 
 class GridNode:
-    __slots__ = ('index', 'elements')
+    __slots__ = ('index', 'island', 'elements')
 
-    def __init__(self, index, elements):
-        self.index = index
+    def __init__(self, index, island, elements):
+        self.index = index         # node index as stored
+        self.island = island       # the pad field: the island in Carbon
         self.elements = elements   # four lists of u32, one per element type
 
 
 class WorldGrid:
     __slots__ = ('minimum', 'edge_size', 'rows', 'cols', 'nodes', 'pointer_size', 'tags',
-                 'problems')
+                 'problems', 'islands', 'island_notes')
 
     def __init__(self, minimum, edge_size, rows, cols):
         self.minimum = minimum          # (x, y, z, w)
@@ -64,6 +79,8 @@ class WorldGrid:
         self.pointer_size = 0
         self.tags = {}                  # tag name -> [block count, total bytes, entries of the first]
         self.problems = []
+        self.islands = []               # (section, origin row, origin col, width, height)
+        self.island_notes = []          # one line per island chunk read
 
     def cell(self, node_index):
         """(min x, min z, max x, max z) of a node."""
@@ -117,7 +134,8 @@ def _parse_nodes(data, start, length, node_limit, pointer_size):
                 return nodes, problems, False
             elements.append(list(struct.unpack_from(f'<{counts[t]}I', data, list_start))
                             if counts[t] else [])
-        nodes.append(GridNode(index, elements))
+        island = struct.unpack_from('<H', data, pos + pointer_size + 2)[0]
+        nodes.append(GridNode(index, island, elements))
         pos += total
     if bad_offsets:
         problems.append(f"{bad_offsets} element offset(s) are not back to back")
@@ -141,6 +159,7 @@ def load_world_grid(path):
         return None
 
     grid = None
+    islands = []
     node_blocks = []   # (start, length, table entries) of every CGcn block
     for child in cdat.children:
         start = child.offset + child.data_offset
@@ -151,8 +170,11 @@ def load_world_grid(path):
             grid = WorldGrid(minimum, edge_size, rows, cols)
         elif child.type == TAG_CGCN:
             node_blocks.append((start, child.data_length, child.num_entries))
+        elif child.type & TAG_MASK == TAG_CL and child.data_length >= 10:
+            islands.append(struct.unpack_from('<5H', data, start))
     if grid is None:
         return None
+    grid.islands = islands
     for child in cdat.children:
         entry = grid.tags.setdefault(_int_to_tag(child.type), [0, 0, child.num_entries])
         entry[0] += 1
@@ -183,6 +205,75 @@ def load_world_grid(path):
     return grid
 
 
+def _find_entries(entry, tag):
+    found = []
+    for child in entry.children or []:
+        if child.type == tag:
+            found.append(child)
+        found.extend(_find_entries(child, tag))
+    return found
+
+
+def load_island_nodes(grid, stream_path, index_mode='auto'):
+    """Adds the nodes of the 0x3B802 chunks of the stream file to the grid. Each chunk is
+    one island. Notes on what was found go to grid.island_notes. index_mode is 'auto' (an
+    index past width * height is global, else local to the island), 'global' or 'local'."""
+    from nfs_region_common import walk_chunks
+    from nfs_carp_parser import TAG_CARP
+    data = open(stream_path, 'rb').read()
+    node_limit = grid.rows * grid.cols
+    islands_by_section = {island[0]: island for island in grid.islands}
+    for offset, raw_id, _id_hex, _length, _is_container, payload_start in walk_chunks(data):
+        if raw_id != ISLAND_CHUNK_ID:
+            continue
+        pos = payload_start + 4
+        while struct.unpack_from('<I', data, pos)[0] == 0x11111111:
+            pos += 4
+        # with the 16 byte bChunkCarpHeader (crp_size, section, flags, last address), or without
+        carp_at = section = None
+        for header_size in (16, 0):
+            if struct.unpack_from('<i', data, pos + header_size)[0] == TAG_CARP:
+                carp_at = pos + header_size
+                section = struct.unpack_from('<I', data, pos + 4)[0] if header_size else None
+                break
+        if carp_at is None:
+            grid.island_notes.append(f"chunk at {offset:#x}: no CARP root found")
+            continue
+        root = parse_carp(data, carp_at)
+        blocks = _find_entries(root, TAG_CGCN)
+        chunk_nodes = []
+        for block in blocks:
+            start = block.offset + block.data_offset
+            for pointer_size in POINTER_SIZES:
+                nodes, problems, clean = _parse_nodes(data, start, block.data_length, 1 << 16,
+                                                      pointer_size)
+                if clean:
+                    chunk_nodes.extend(nodes)
+                    break
+            else:
+                grid.problems.append(f"island chunk {offset:#x}: CGcn block does not parse cleanly")
+        island = islands_by_section.get(section)
+        note = (f"island chunk at {offset:#x}: section {section}, {len(blocks)} CGcn block(s), "
+                f"{len(chunk_nodes)} node(s)")
+        if island is None:
+            note += "; no 'cl' island with this section number"
+        else:
+            _s, row0, col0, width, height = island
+            top = max((n.index for n in chunk_nodes), default=0)
+            local = index_mode == 'local' or (index_mode == 'auto' and top < width * height)
+            if not local:
+                note += f"; node indexes reach {top} (island is {width}*{height}), read as global"
+            else:
+                note += f"; node indexes reach {top} (island is {width}*{height}), read as local to the island"
+                for n in chunk_nodes:
+                    n.index = (row0 + n.index // width) * grid.cols + col0 + n.index % width
+        if any(n.index >= node_limit for n in chunk_nodes):
+            note += "; some indexes are outside the grid"
+        grid.island_notes.append(note)
+        grid.nodes.extend(chunk_nodes)
+    return grid
+
+
 def element_section_index(raw):
     """Global instance index to (section number, index in that section's pack)."""
     return raw >> 16, raw & 0xFFFF
@@ -193,11 +284,11 @@ def write_grid_nodes_tsv(grid, path):
     for node in sorted(grid.nodes, key=lambda n: n.index):
         row, col = divmod(node.index, grid.cols)
         x0, z0, x1, z1 = grid.cell(node.index)
-        rows.append([node.index, row, col, f"{x0:.2f}", f"{z0:.2f}", f"{x1:.2f}", f"{z1:.2f}",
+        rows.append([node.index, node.island, row, col, f"{x0:.2f}", f"{z0:.2f}", f"{x1:.2f}", f"{z1:.2f}",
                      *(len(e) for e in node.elements)])
     with open(path, 'w', encoding='utf-8', newline='') as f:
         writer = csv.writer(f, delimiter='\t', lineterminator='\n')
-        writer.writerow(['Node', 'Row', 'Col', 'MinX', 'MinZ', 'MaxX', 'MaxZ', 'Instances',
+        writer.writerow(['Node', 'Island', 'Row', 'Col', 'MinX', 'MinZ', 'MaxX', 'MaxZ', 'Instances',
                          'Triggers', 'Objects', 'RoadSegments'])
         writer.writerows(rows)
     return len(rows)
@@ -225,6 +316,11 @@ def check_world_grid(grid, packs=None):
     print(f"[nfs_world_grid] node pointer size {grid.pointer_size}; blocks under CDat:")
     for key, (count, size, entries) in sorted(grid.tags.items()):
         print(f"  {key:<6} {count:>4} block(s) {size:>10} byte(s), table entries {entries}")
+    for island in grid.islands:
+        print(f"[nfs_world_grid] island: section {island[0]}, origin row {island[1]}, col "
+              f"{island[2]}, {island[3]} wide, {island[4]} high")
+    for note in grid.island_notes:
+        print(f"[nfs_world_grid] {note}")
     for problem in grid.problems:
         print(f"[nfs_world_grid] problem: {problem}")
 
@@ -294,8 +390,12 @@ def check_world_grid(grid, packs=None):
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Write the world grid TSV files from the region file.")
     ap.add_argument('region_bun', help="region file (L5RA.BUN), the one with the CARP world grid")
-    ap.add_argument('--stream', help="stream file (STREAML5RA.BUN): also check the grid against "
-                                     "its collision packs")
+    ap.add_argument('--stream', help="stream file (STREAML5RA.BUN): reads the island nodes "
+                                     "(chunk 0x3B802) from it and checks the grid against its "
+                                     "collision packs")
+    ap.add_argument('--island-index', choices=('auto', 'global', 'local'), default='auto',
+                    help="how the node indexes of an island chunk are read (default auto: past "
+                         "width * height means global). Use the cell check line to pick")
     ap.add_argument('--out', help="output folder (default outputs/nfs_world_grid/)")
     args = ap.parse_args(argv)
 
@@ -306,6 +406,8 @@ def main(argv=None):
     if grid is None:
         print("[nfs_world_grid] no CarpWorldGrid with a CDat block in this file")
         return
+    if args.stream:
+        load_island_nodes(grid, args.stream, args.island_index)
     out = Path(args.out) if args.out else out_dir(TOOL_NAME)
     out.mkdir(parents=True, exist_ok=True)
     node_count = write_grid_nodes_tsv(grid, out / 'world_grid_nodes.tsv')
