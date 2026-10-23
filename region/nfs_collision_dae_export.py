@@ -29,10 +29,20 @@ region/export_sections.py and the traffic node exporter; the vertical offset (de
 applied here once. The mapping flips handedness, the triangle order is kept as read.
 
 Per shape, equal vertices (rounded to 0.1 mm) are welded and each triangle gets one flat
-normal. No materials: surface bytes and surface hashes are not exported yet.
+normal.
+
+Materials: one material per collision surface, like the game: a mesh holds several materials
+and each triangle (strip triangle or wall quad) belongs to the surface of its face/edge. The
+surface is looked up in the surface table of its own article (nfs_collision_surfaces.py explains
+the lookup) and named nfs_surface_<VLT name from hashes_main.txt>. Special names: nfs_surface_none
+(null reference 0x00000000), nfs_surface_0xHASH (hash without a name, never merged),
+nfs_surface_notable and nfs_surface_badindex (article without a table / index past its end).
+Each material has a flat viewport color from its name, to tell surfaces apart in Blender.
+collision_surface_materials.json lists every material with its raw hash and an empty
+"groundType" to fill in; an existing file keeps the groundType values already entered.
 
 Output: <folder>/<section>_base.dae, <section>_g<group>.dae and collision_index.json
-(shape list, counts, options). Default folder: outputs/nfs_collision_dae/collision/.
+(shape list, counts, materials per shape, options). Default folder: outputs/nfs_collision_dae/collision/.
 Layout of the pack data: see the docstring of nfs_collision_pack.py. Checked on synthetic data
 (tests/test_collision_dae_export.py); run it on the real file first.
 """
@@ -41,14 +51,18 @@ import pathlib as _pl, sys as _sys
 _sys.path[:0] = [str(_pl.Path(__file__).resolve().parents[1] / _d) for _d in ['common', 'region', 'scenery', 'solids_materials']]
 
 import argparse
+import colorsys
 import datetime
 import json
 import math
 import os
 import queue
 import threading
+import zlib
 
 from nfs_collision_pack import load_collision_packs, true_position, local_to_world
+from nfs_collision_surfaces import surface_key, material_name
+from nfs_hash_dictionary import load_vlt_dictionary
 from nfs_outputs import out_dir
 
 TOOL_NAME = 'nfs_collision_dae_export'
@@ -68,9 +82,10 @@ def to_beamng(point, vertical_offset):
 
 
 class Shape:
-    """One DAE: welded vertices and triangles (vertex index triples)."""
+    """One DAE: welded vertices and triangles (three vertex indexes and a material name).
+    materials: {material name: [raw hash text or None, triangle count]}."""
     __slots__ = ('section', 'group', 'vertices', 'lookup', 'triangles', 'instances',
-                 'strip_triangles', 'wall_quads', 'dropped')
+                 'strip_triangles', 'wall_quads', 'dropped', 'materials')
 
     def __init__(self, section, group):
         self.section = section
@@ -82,6 +97,7 @@ class Shape:
         self.strip_triangles = 0
         self.wall_quads = 0
         self.dropped = 0        # degenerate triangles and walls
+        self.materials = {}
 
     @property
     def name(self):
@@ -96,13 +112,16 @@ class Shape:
             self.lookup[key] = index
         return index
 
-    def add_triangle(self, a, b, c):
-        """Adds a triangle from three BeamNG points. Returns False when it is degenerate
-        (nothing is added then, so no loose vertices are left)."""
+    def add_triangle(self, a, b, c, surface):
+        """Adds a triangle from three BeamNG points; surface is (material name, raw hash text
+        or None). Returns False when it is degenerate (nothing is added then, so no loose
+        vertices are left)."""
         a, b, c = (tuple(round(v, WELD_DIGITS) for v in point) for point in (a, b, c))
         if _normal(a, b, c)[3] < MIN_TRIANGLE_AREA2:
             return False
-        self.triangles.append((self._vertex(a), self._vertex(b), self._vertex(c)))
+        material, hash_text = surface
+        self.triangles.append((self._vertex(a), self._vertex(b), self._vertex(c), material))
+        self.materials.setdefault(material, [hash_text, 0])[1] += 1
         return True
 
 
@@ -132,9 +151,17 @@ def parse_section_filter(text):
 
 
 def build_shapes(packs, sections=None, strips=True, walls=True, double_sided_walls=True,
-                 vertical_offset=DEFAULT_VERTICAL_OFFSET, progress=None):
+                 vertical_offset=DEFAULT_VERTICAL_OFFSET, progress=None, names=None):
     """One Shape per (section, group number). Returns (shapes, stats). shapes is sorted by
-    section, then group (base first)."""
+    section, then group (base first). names is {vlt hash: surface name} (default: the VLT
+    dictionary of hashes_main.txt)."""
+    if names is None:
+        names = load_vlt_dictionary()
+
+    def surface_of(article, index):
+        key = surface_key(article, index)
+        return material_name(key, names), (f"0x{key:08X}" if isinstance(key, int) else None)
+
     shapes = {}
     stats = {'packs': 0, 'instances': 0, 'no_article': 0}
     chosen = [p for p in packs if sections is None or p.section_number in sections]
@@ -158,8 +185,10 @@ def build_shapes(packs, sections=None, strips=True, walls=True, double_sided_wal
                               for v in strip.vertices]
                     for t in range(len(points) - 2):
                         a, b, c = points[t], points[t + 1], points[t + 2]
-                        ok = (shape.add_triangle(a, b, c) if t % 2 == 0
-                              else shape.add_triangle(b, a, c))
+                        surface = surface_of(article, strip.surfaces[t] if t < len(strip.surfaces)
+                                             else len(article.surface_hashes))
+                        ok = (shape.add_triangle(a, b, c, surface) if t % 2 == 0
+                              else shape.add_triangle(b, a, c, surface))
                         if ok:
                             shape.strip_triangles += 1
                         else:
@@ -176,9 +205,12 @@ def build_shapes(packs, sections=None, strips=True, walls=True, double_sided_wal
                     p1 = to_beamng((b[0], y_bottom, b[2]), vertical_offset)
                     p2 = to_beamng((b[0], y_top, b[2]), vertical_offset)
                     p3 = to_beamng((a[0], y_top, a[2]), vertical_offset)
-                    added = shape.add_triangle(p0, p1, p2) + shape.add_triangle(p0, p2, p3)
+                    surface = surface_of(article, edge.surface)
+                    added = (shape.add_triangle(p0, p1, p2, surface)
+                             + shape.add_triangle(p0, p2, p3, surface))
                     if double_sided_walls:
-                        added += shape.add_triangle(p0, p2, p1) + shape.add_triangle(p0, p3, p2)
+                        added += (shape.add_triangle(p0, p2, p1, surface)
+                                  + shape.add_triangle(p0, p3, p2, surface))
                     if added:
                         shape.wall_quads += 1
                     else:
@@ -195,18 +227,42 @@ def _floats(values):
     return ' '.join(f"{v:.6g}" if abs(v) < 1e5 else f"{v:.4f}" for v in values)
 
 
+def material_color(name):
+    """A flat color from the material name, so surfaces can be told apart in the viewport."""
+    hue = (zlib.crc32(name.encode('ascii', errors='ignore')) % 360) / 360.0
+    r, g, bl = colorsys.hsv_to_rgb(hue, 0.55, 0.85)
+    return f"{r:.3f} {g:.3f} {bl:.3f} 1"
+
+
 def dae_text(shape):
-    """The COLLADA document of one shape (1.4.1, Z up, meters)."""
+    """The COLLADA document of one shape (1.4.1, Z up, meters): one <triangles> block and one
+    material per surface."""
     name = shape.name
     positions = [c for v in shape.vertices for c in v]
     normals = []
-    indices = []
-    for n, (ia, ib, ic) in enumerate(shape.triangles):
+    by_material = {}
+    for n, (ia, ib, ic, material) in enumerate(shape.triangles):
         nx, ny, nz, length2 = _normal(shape.vertices[ia], shape.vertices[ib], shape.vertices[ic])
         length = math.sqrt(length2)
         normals.extend((nx / length, ny / length, nz / length))
-        indices.extend((ia, n, ib, n, ic, n))
+        by_material.setdefault(material, []).extend((ia, n, ib, n, ic, n))
+    materials = sorted(by_material)
     now = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    effects = ''.join(
+        f'    <effect id="{m}-fx"><profile_COMMON><technique sid="common"><lambert><diffuse>'
+        f'<color>{material_color(m)}</color></diffuse></lambert></technique></profile_COMMON></effect>\n'
+        for m in materials)
+    material_defs = ''.join(
+        f'    <material id="{m}" name="{m}"><instance_effect url="#{m}-fx"/></material>\n'
+        for m in materials)
+    blocks = ''.join(
+        f'        <triangles material="{m}" count="{len(by_material[m]) // 6}">\n'
+        f'          <input semantic="VERTEX" source="#{name}-vertices" offset="0"/>\n'
+        f'          <input semantic="NORMAL" source="#{name}-normals" offset="1"/>\n'
+        f'          <p>{" ".join(map(str, by_material[m]))}</p>\n'
+        f'        </triangles>\n'
+        for m in materials)
+    bindings = ''.join(f'<instance_material symbol="{m}" target="#{m}"/>' for m in materials)
     return f"""<?xml version="1.0" encoding="utf-8"?>
 <COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema" version="1.4.1">
   <asset>
@@ -216,6 +272,10 @@ def dae_text(shape):
     <unit name="meter" meter="1"/>
     <up_axis>Z_UP</up_axis>
   </asset>
+  <library_effects>
+{effects}  </library_effects>
+  <library_materials>
+{material_defs}  </library_materials>
   <library_geometries>
     <geometry id="{name}-mesh" name="{name}">
       <mesh>
@@ -228,17 +288,12 @@ def dae_text(shape):
           <technique_common><accessor source="#{name}-normals-array" count="{len(shape.triangles)}" stride="3"><param name="X" type="float"/><param name="Y" type="float"/><param name="Z" type="float"/></accessor></technique_common>
         </source>
         <vertices id="{name}-vertices"><input semantic="POSITION" source="#{name}-positions"/></vertices>
-        <triangles count="{len(shape.triangles)}">
-          <input semantic="VERTEX" source="#{name}-vertices" offset="0"/>
-          <input semantic="NORMAL" source="#{name}-normals" offset="1"/>
-          <p>{' '.join(map(str, indices))}</p>
-        </triangles>
-      </mesh>
+{blocks}      </mesh>
     </geometry>
   </library_geometries>
   <library_visual_scenes>
     <visual_scene id="Scene" name="Scene">
-      <node id="{name}" name="{name}" type="NODE"><instance_geometry url="#{name}-mesh"/></node>
+      <node id="{name}" name="{name}" type="NODE"><instance_geometry url="#{name}-mesh"><bind_material><technique_common>{bindings}</technique_common></bind_material></instance_geometry></node>
     </visual_scene>
   </library_visual_scenes>
   <scene><instance_visual_scene url="#Scene"/></scene>
@@ -265,15 +320,46 @@ def _packs_for(stream_path, log):
     return _pack_cache[key]
 
 
+def _write_material_list(out_folder, index):
+    """collision_surface_materials.json: every material with its raw hash, triangle total and
+    a "groundType" to fill in. Values already entered in an existing file are kept (also for
+    materials this export did not produce), so re-exporting never loses them. Returns the number
+    of materials."""
+    path = os.path.join(out_folder, 'collision_surface_materials.json')
+    old = {}
+    try:
+        with open(path, encoding='utf-8') as f:
+            old = {m['material']: m for m in json.load(f).get('materials', []) if 'material' in m}
+    except (OSError, ValueError, AttributeError):
+        pass
+    found = {}
+    for row in index:
+        for m in row['materials']:
+            entry = found.setdefault(m['material'], {'hash': m['hash'], 'triangles': 0, 'shapes': 0})
+            entry['triangles'] += m['triangles']
+            entry['shapes'] += 1
+    merged = {}
+    for name, entry in old.items():      # keep what is there, refresh the counts of what was exported
+        merged[name] = dict(entry)
+    for name, entry in found.items():
+        merged[name] = {'material': name, 'hash': entry['hash'],
+                        'groundType': old.get(name, {}).get('groundType', ''),
+                        'triangles': entry['triangles'], 'shapes': entry['shapes']}
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump({'materials': [merged[k] for k in sorted(merged)]}, f, indent=1)
+    return len(found)
+
+
 def export_collision(stream_path, out_folder, region_path=None, sections=None, strips=True,
                      walls=True, double_sided_walls=True,
-                     vertical_offset=DEFAULT_VERTICAL_OFFSET, log=print, progress=None):
-    """Writes every shape as a DAE plus collision_index.json to out_folder. Returns a summary
-    dict. log(text) and progress(phase, done, total) are optional callbacks."""
+                     vertical_offset=DEFAULT_VERTICAL_OFFSET, log=print, progress=None, names=None):
+    """Writes every shape as a DAE plus collision_index.json and
+    collision_surface_materials.json to out_folder. Returns a summary dict. log(text) and
+    progress(phase, done, total) are optional callbacks; names is {vlt hash: name}."""
     packs = _packs_for(stream_path, log)
     log(f"{len(packs)} collision pack(s) in the file.")
     shapes, stats = build_shapes(packs, sections, strips, walls, double_sided_walls,
-                                 vertical_offset, progress)
+                                 vertical_offset, progress, names)
     keys = {}
     if region_path:
         log(f"Reading groups from {region_path} ...")
@@ -293,7 +379,9 @@ def export_collision(stream_path, out_folder, region_path=None, sections=None, s
             row = {'file': shape.name + '.dae', 'section': shape.section, 'group': shape.group,
                    'instances': shape.instances, 'vertices': len(shape.vertices),
                    'triangles': len(shape.triangles), 'stripTriangles': shape.strip_triangles,
-                   'wallQuads': shape.wall_quads, 'dropped': shape.dropped}
+                   'wallQuads': shape.wall_quads, 'dropped': shape.dropped,
+                   'materials': [{'material': m, 'hash': h, 'triangles': n}
+                                 for m, (h, n) in sorted(shape.materials.items())]}
             if shape.group and shape.group in keys:
                 row['groupKey'], resolved = keys[shape.group]
                 if resolved:
@@ -309,6 +397,8 @@ def export_collision(stream_path, out_folder, region_path=None, sections=None, s
                'instances_without_article': stats['no_article'],
                'group_shapes': sum(1 for r in index if r['group']),
                'group_shapes_without_key': unknown if region_path else None}
+    material_summary = _write_material_list(out_folder, index)
+    summary['materials'] = material_summary
     manifest = {'tool': TOOL_NAME, 'stream': os.path.abspath(stream_path),
                 'region': os.path.abspath(region_path) if region_path else None,
                 'coordinateMapping': 'NFS (x,y,z) -> BeamNG (z,-x,y+verticalOffset)',
@@ -319,6 +409,7 @@ def export_collision(stream_path, out_folder, region_path=None, sections=None, s
     with open(os.path.join(out_folder, 'collision_index.json'), 'w', encoding='utf-8') as f:
         json.dump(manifest, f, indent=1)
     log(f"Wrote {written} DAE file(s), {triangles} triangle(s), to {out_folder}")
+    log(f"{material_summary} surface material(s) in collision_surface_materials.json")
     log(f"{summary['group_shapes']} group shape(s); {empty} empty shape(s) skipped; "
         f"{stats['no_article']} instance(s) without an article.")
     if region_path and unknown:
@@ -522,6 +613,7 @@ def main(argv=None):
     ap.add_argument('--sections', default='', help="section numbers, e.g. 1021,1100-1110 (default all)")
     ap.add_argument('--vertical-offset', type=float, default=DEFAULT_VERTICAL_OFFSET,
                     help=f"added to the height once (default {DEFAULT_VERTICAL_OFFSET:g})")
+    ap.add_argument('--hashes', help="wordlist for the surface names (default common/hashes_main.txt)")
     ap.add_argument('--no-strips', action='store_true', help="skip the triangle strips")
     ap.add_argument('--no-walls', action='store_true', help="skip the barrier walls")
     ap.add_argument('--single-sided-walls', action='store_true', help="no flipped copy of the walls")
@@ -534,7 +626,8 @@ def main(argv=None):
     out = args.out or str(out_dir(TOOL_NAME) / 'collision')
     export_collision(args.stream_bun, out, args.region_bun, parse_section_filter(args.sections),
                      not args.no_strips, not args.no_walls, not args.single_sided_walls,
-                     args.vertical_offset, log=lambda text: print(f"[{TOOL_NAME}] {text}"))
+                     args.vertical_offset, log=lambda text: print(f"[{TOOL_NAME}] {text}"),
+                     names=load_vlt_dictionary(args.hashes) if args.hashes else None)
 
 
 if __name__ == '__main__':

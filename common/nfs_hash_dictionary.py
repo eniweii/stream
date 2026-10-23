@@ -1,7 +1,9 @@
 """
 Loads a plain wordlist (one candidate string per line, '#' comments
 allowed) from the same directory as this file - NOT embedded in the code -
-and hashes every line with bin_hash() to build a reverse hash->name lookup.
+and hashes every line with bin_hash() (bin family) or vlt_hash() (VLT / Attrib key family) to
+build a reverse hash->name lookup. Which family a hash belongs to depends on what it keys:
+scenery group keys are bin, vault collection keys and collision surface hashes are VLT.
 
 Point this at CiPH3R-88/NFS_Raider_v2.0's hashes_main.txt (or any similarly-
 shaped wordlist) by dropping it next to these scripts as hashes_main.txt.
@@ -14,11 +16,12 @@ _sys.path[:0] = [str(_pl.Path(__file__).resolve().parents[1] / _d) for _d in ['c
 
 import os
 
-from nfs_hashing import bin_hash
+from nfs_hashing import bin_hash, vlt_hash
 
 _DEFAULT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hashes_main.txt")
 
 _cache = {}  # path -> {hash: name}
+_vlt_cache = {}  # path -> {hash: name}
 
 
 def load_dictionary(path=_DEFAULT_PATH):
@@ -44,3 +47,28 @@ def load_dictionary(path=_DEFAULT_PATH):
 
 def resolve(hash_value, path=_DEFAULT_PATH):
     return load_dictionary(path).get(hash_value)
+
+
+def load_vlt_dictionary(path=_DEFAULT_PATH):
+    """Returns {vlt hash: name} from the same wordlist. Lines with non-ASCII characters are
+    skipped (they cannot be vault names). Empty dict if the file isn't present."""
+    if path in _vlt_cache:
+        return _vlt_cache[path]
+
+    table = {}
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#') or not line.isascii():
+                    continue
+                table.setdefault(vlt_hash(line), line)
+    except FileNotFoundError:
+        pass
+
+    _vlt_cache[path] = table
+    return table
+
+
+def resolve_vlt(hash_value, path=_DEFAULT_PATH):
+    return load_vlt_dictionary(path).get(hash_value)
