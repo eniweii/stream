@@ -1,0 +1,541 @@
+"""
+Collision DAE export: the collision packs of the stream file (chunk 0x3B801, read by
+nfs_collision_pack.py) written as one COLLADA file per collision shape, in BeamNG
+coordinates, ready to open in Blender and later to stream.
+
+A window opens when the script runs without arguments. With a stream file argument it
+runs on the command line (--help lists the options).
+
+Shapes (one DAE each, named <section>_base.dae and <section>_g<group number>.dae):
+    base   every instance of the section whose group number is 0 (always on)
+    group  every instance of the section with that group number (barrier group, only
+           active while the scenery group of that number is enabled, see
+           nfs_collision_pack.match_by_group). The group key hash, the same hash the
+           visual objects carry as sectionOverrideName, is written to collision_index.json
+           when the region file is given.
+The section number of a pack is the visual section id (every instance of the real file lies
+inside the polygon of its own section, checked against sections.json).
+
+Geometry of an article (CollisionArticle) is read the way nfs_collision_pack.write_collision_obj
+reads it:
+    strips  triangle strips: N vertices give N - 2 triangles, odd triangles swap the first two
+            vertices so the winding stays the same
+    edges   barrier walls: two points and a bottom and top height, no surface. Each edge is
+            stood up as a quad (2 triangles) between YBot and YTop. Many articles have only
+            edges, so without this step they would be missing from the DAE
+World position of a vertex: nfs_collision_pack.local_to_world (instance matrix rows and true
+position). Then NFS (x, y, z) -> BeamNG (z, -x, y + vertical offset), the same mapping as
+region/export_sections.py and the traffic node exporter; the vertical offset (default 150) is
+applied here once. The mapping flips handedness, the triangle order is kept as read.
+
+Per shape, equal vertices (rounded to 0.1 mm) are welded and each triangle gets one flat
+normal. No materials: surface bytes and surface hashes are not exported yet.
+
+Output: <folder>/<section>_base.dae, <section>_g<group>.dae and collision_index.json
+(shape list, counts, options). Default folder: outputs/nfs_collision_dae/collision/.
+Layout of the pack data: see the docstring of nfs_collision_pack.py. Checked on synthetic data
+(tests/test_collision_dae_export.py); run it on the real file first.
+"""
+# stream bootstrap: make the shared library folders importable
+import pathlib as _pl, sys as _sys
+_sys.path[:0] = [str(_pl.Path(__file__).resolve().parents[1] / _d) for _d in ['common', 'region', 'scenery', 'solids_materials']]
+
+import argparse
+import datetime
+import json
+import math
+import os
+import queue
+import threading
+
+from nfs_collision_pack import load_collision_packs, true_position, local_to_world
+from nfs_outputs import out_dir
+
+TOOL_NAME = 'nfs_collision_dae_export'
+DEFAULT_VERTICAL_OFFSET = 150.0
+WELD_DIGITS = 4            # vertices closer than 0.1 mm are one vertex
+MIN_WALL_HEIGHT = 1e-4     # an edge with a smaller bottom to top distance is not a wall
+MIN_TRIANGLE_AREA2 = 1e-12 # squared cross product length below which a triangle is dropped
+
+_pack_cache = {}           # (path, mtime, size) -> packs, so a second export does not reload
+
+
+# ---- Geometry ----
+
+def to_beamng(point, vertical_offset):
+    """NFS (x, y, z) -> BeamNG (z, -x, y + vertical offset)."""
+    return (point[2], -point[0], point[1] + vertical_offset)
+
+
+class Shape:
+    """One DAE: welded vertices and triangles (vertex index triples)."""
+    __slots__ = ('section', 'group', 'vertices', 'lookup', 'triangles', 'instances',
+                 'strip_triangles', 'wall_quads', 'dropped')
+
+    def __init__(self, section, group):
+        self.section = section
+        self.group = group
+        self.vertices = []
+        self.lookup = {}
+        self.triangles = []
+        self.instances = 0
+        self.strip_triangles = 0
+        self.wall_quads = 0
+        self.dropped = 0        # degenerate triangles and walls
+
+    @property
+    def name(self):
+        return f"{self.section}_base" if self.group == 0 else f"{self.section}_g{self.group}"
+
+    def _vertex(self, point):
+        key = tuple(round(c, WELD_DIGITS) for c in point)
+        index = self.lookup.get(key)
+        if index is None:
+            index = len(self.vertices)
+            self.vertices.append(key)
+            self.lookup[key] = index
+        return index
+
+    def add_triangle(self, a, b, c):
+        """Adds a triangle from three BeamNG points. Returns False when it is degenerate
+        (nothing is added then, so no loose vertices are left)."""
+        a, b, c = (tuple(round(v, WELD_DIGITS) for v in point) for point in (a, b, c))
+        if _normal(a, b, c)[3] < MIN_TRIANGLE_AREA2:
+            return False
+        self.triangles.append((self._vertex(a), self._vertex(b), self._vertex(c)))
+        return True
+
+
+def _normal(a, b, c):
+    u = (b[0] - a[0], b[1] - a[1], b[2] - a[2])
+    v = (c[0] - a[0], c[1] - a[1], c[2] - a[2])
+    n = (u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0])
+    return n[0], n[1], n[2], n[0] * n[0] + n[1] * n[1] + n[2] * n[2]
+
+
+def parse_section_filter(text):
+    """'1021, 1100-1110' -> set of section numbers. Blank gives None (all sections)."""
+    text = (text or '').strip()
+    if not text:
+        return None
+    numbers = set()
+    for part in text.replace(';', ',').split(','):
+        part = part.strip()
+        if not part:
+            continue
+        if '-' in part:
+            low, high = part.split('-', 1)
+            numbers.update(range(int(low), int(high) + 1))
+        else:
+            numbers.add(int(part))
+    return numbers
+
+
+def build_shapes(packs, sections=None, strips=True, walls=True, double_sided_walls=True,
+                 vertical_offset=DEFAULT_VERTICAL_OFFSET, progress=None):
+    """One Shape per (section, group number). Returns (shapes, stats). shapes is sorted by
+    section, then group (base first)."""
+    shapes = {}
+    stats = {'packs': 0, 'instances': 0, 'no_article': 0}
+    chosen = [p for p in packs if sections is None or p.section_number in sections]
+    for done, pack in enumerate(chosen):
+        stats['packs'] += 1
+        for ci in pack.instances:
+            article = pack.articles.get(ci.instance_id)
+            if article is None:
+                stats['no_article'] += 1
+                continue
+            stats['instances'] += 1
+            shape = shapes.get((pack.section_number, ci.group_number))
+            if shape is None:
+                shape = shapes[(pack.section_number, ci.group_number)] = Shape(
+                    pack.section_number, ci.group_number)
+            shape.instances += 1
+            position = true_position(ci)
+            if strips:
+                for strip in article.strips:
+                    points = [to_beamng(local_to_world(ci, v, position), vertical_offset)
+                              for v in strip.vertices]
+                    for t in range(len(points) - 2):
+                        a, b, c = points[t], points[t + 1], points[t + 2]
+                        ok = (shape.add_triangle(a, b, c) if t % 2 == 0
+                              else shape.add_triangle(b, a, c))
+                        if ok:
+                            shape.strip_triangles += 1
+                        else:
+                            shape.dropped += 1
+            if walls:
+                for edge in article.edges:
+                    a = local_to_world(ci, edge.minimum, position)
+                    b = local_to_world(ci, edge.maximum, position)
+                    y_bottom, y_top = min(a[1], b[1]), max(a[1], b[1])
+                    if y_top - y_bottom < MIN_WALL_HEIGHT or (a[0] == b[0] and a[2] == b[2]):
+                        shape.dropped += 1
+                        continue
+                    p0 = to_beamng((a[0], y_bottom, a[2]), vertical_offset)
+                    p1 = to_beamng((b[0], y_bottom, b[2]), vertical_offset)
+                    p2 = to_beamng((b[0], y_top, b[2]), vertical_offset)
+                    p3 = to_beamng((a[0], y_top, a[2]), vertical_offset)
+                    added = shape.add_triangle(p0, p1, p2) + shape.add_triangle(p0, p2, p3)
+                    if double_sided_walls:
+                        added += shape.add_triangle(p0, p2, p1) + shape.add_triangle(p0, p3, p2)
+                    if added:
+                        shape.wall_quads += 1
+                    else:
+                        shape.dropped += 1
+        if progress:
+            progress('Reading packs', done + 1, len(chosen))
+    ordered = sorted(shapes.values(), key=lambda s: (s.section, s.group))
+    return ordered, stats
+
+
+# ---- DAE ----
+
+def _floats(values):
+    return ' '.join(f"{v:.6g}" if abs(v) < 1e5 else f"{v:.4f}" for v in values)
+
+
+def dae_text(shape):
+    """The COLLADA document of one shape (1.4.1, Z up, meters)."""
+    name = shape.name
+    positions = [c for v in shape.vertices for c in v]
+    normals = []
+    indices = []
+    for n, (ia, ib, ic) in enumerate(shape.triangles):
+        nx, ny, nz, length2 = _normal(shape.vertices[ia], shape.vertices[ib], shape.vertices[ic])
+        length = math.sqrt(length2)
+        normals.extend((nx / length, ny / length, nz / length))
+        indices.extend((ia, n, ib, n, ic, n))
+    now = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    return f"""<?xml version="1.0" encoding="utf-8"?>
+<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema" version="1.4.1">
+  <asset>
+    <contributor><authoring_tool>{TOOL_NAME}</authoring_tool></contributor>
+    <created>{now}</created>
+    <modified>{now}</modified>
+    <unit name="meter" meter="1"/>
+    <up_axis>Z_UP</up_axis>
+  </asset>
+  <library_geometries>
+    <geometry id="{name}-mesh" name="{name}">
+      <mesh>
+        <source id="{name}-positions">
+          <float_array id="{name}-positions-array" count="{len(positions)}">{_floats(positions)}</float_array>
+          <technique_common><accessor source="#{name}-positions-array" count="{len(shape.vertices)}" stride="3"><param name="X" type="float"/><param name="Y" type="float"/><param name="Z" type="float"/></accessor></technique_common>
+        </source>
+        <source id="{name}-normals">
+          <float_array id="{name}-normals-array" count="{len(normals)}">{_floats(normals)}</float_array>
+          <technique_common><accessor source="#{name}-normals-array" count="{len(shape.triangles)}" stride="3"><param name="X" type="float"/><param name="Y" type="float"/><param name="Z" type="float"/></accessor></technique_common>
+        </source>
+        <vertices id="{name}-vertices"><input semantic="POSITION" source="#{name}-positions"/></vertices>
+        <triangles count="{len(shape.triangles)}">
+          <input semantic="VERTEX" source="#{name}-vertices" offset="0"/>
+          <input semantic="NORMAL" source="#{name}-normals" offset="1"/>
+          <p>{' '.join(map(str, indices))}</p>
+        </triangles>
+      </mesh>
+    </geometry>
+  </library_geometries>
+  <library_visual_scenes>
+    <visual_scene id="Scene" name="Scene">
+      <node id="{name}" name="{name}" type="NODE"><instance_geometry url="#{name}-mesh"/></node>
+    </visual_scene>
+  </library_visual_scenes>
+  <scene><instance_visual_scene url="#Scene"/></scene>
+</COLLADA>
+"""
+
+
+# ---- Export ----
+
+def _group_keys(region_path):
+    """group number -> (key hex, resolved name or None), from the region file's scenery groups."""
+    from nfs_stream_scenery import load_stream_scenery
+    scenery = load_stream_scenery(region_path)
+    return {g.group_number: (f"0x{g.key:08X}", g.name) for g in scenery.groups}
+
+
+def _packs_for(stream_path, log):
+    stat = os.stat(stream_path)
+    key = (os.path.abspath(stream_path), stat.st_mtime, stat.st_size)
+    if key not in _pack_cache:
+        log(f"Reading {stream_path} ...")
+        _pack_cache.clear()
+        _pack_cache[key] = load_collision_packs(stream_path)
+    return _pack_cache[key]
+
+
+def export_collision(stream_path, out_folder, region_path=None, sections=None, strips=True,
+                     walls=True, double_sided_walls=True,
+                     vertical_offset=DEFAULT_VERTICAL_OFFSET, log=print, progress=None):
+    """Writes every shape as a DAE plus collision_index.json to out_folder. Returns a summary
+    dict. log(text) and progress(phase, done, total) are optional callbacks."""
+    packs = _packs_for(stream_path, log)
+    log(f"{len(packs)} collision pack(s) in the file.")
+    shapes, stats = build_shapes(packs, sections, strips, walls, double_sided_walls,
+                                 vertical_offset, progress)
+    keys = {}
+    if region_path:
+        log(f"Reading groups from {region_path} ...")
+        keys = _group_keys(region_path)
+
+    os.makedirs(out_folder, exist_ok=True)
+    index = []
+    written = empty = 0
+    for done, shape in enumerate(shapes):
+        if not shape.triangles:
+            empty += 1
+        else:
+            with open(os.path.join(out_folder, shape.name + '.dae'), 'w', encoding='utf-8',
+                      newline='\n') as f:
+                f.write(dae_text(shape))
+            written += 1
+            row = {'file': shape.name + '.dae', 'section': shape.section, 'group': shape.group,
+                   'instances': shape.instances, 'vertices': len(shape.vertices),
+                   'triangles': len(shape.triangles), 'stripTriangles': shape.strip_triangles,
+                   'wallQuads': shape.wall_quads, 'dropped': shape.dropped}
+            if shape.group and shape.group in keys:
+                row['groupKey'], resolved = keys[shape.group]
+                if resolved:
+                    row['groupName'] = resolved
+            index.append(row)
+        if progress:
+            progress('Writing DAE files', done + 1, len(shapes))
+
+    triangles = sum(r['triangles'] for r in index)
+    unknown = sum(1 for r in index if r['group'] and 'groupKey' not in r)
+    summary = {'files': written, 'empty_shapes': empty, 'triangles': triangles,
+               'packs': stats['packs'], 'instances': stats['instances'],
+               'instances_without_article': stats['no_article'],
+               'group_shapes': sum(1 for r in index if r['group']),
+               'group_shapes_without_key': unknown if region_path else None}
+    manifest = {'tool': TOOL_NAME, 'stream': os.path.abspath(stream_path),
+                'region': os.path.abspath(region_path) if region_path else None,
+                'coordinateMapping': 'NFS (x,y,z) -> BeamNG (z,-x,y+verticalOffset)',
+                'verticalOffset': vertical_offset,
+                'options': {'strips': strips, 'walls': walls, 'doubleSidedWalls': double_sided_walls,
+                            'sections': sorted(sections) if sections else 'all'},
+                'summary': summary, 'shapes': index}
+    with open(os.path.join(out_folder, 'collision_index.json'), 'w', encoding='utf-8') as f:
+        json.dump(manifest, f, indent=1)
+    log(f"Wrote {written} DAE file(s), {triangles} triangle(s), to {out_folder}")
+    log(f"{summary['group_shapes']} group shape(s); {empty} empty shape(s) skipped; "
+        f"{stats['no_article']} instance(s) without an article.")
+    if region_path and unknown:
+        log(f"{unknown} group shape(s) have a group number that is not a scenery group in the "
+            f"region file (no key written).")
+    return summary
+
+
+# ---- Window ----
+
+def _settings_path():
+    return out_dir(TOOL_NAME) / 'settings.json'
+
+
+def _load_settings():
+    try:
+        return json.loads(_settings_path().read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return {}
+
+
+def run_window():
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+
+    class App(tk.Tk):
+        def __init__(self):
+            super().__init__()
+            self.title("Collision DAE export")
+            self.minsize(680, 480)
+            s = _load_settings()
+            self.stream_var = tk.StringVar(value=s.get('stream', ''))
+            self.region_var = tk.StringVar(value=s.get('region', ''))
+            self.out_var = tk.StringVar(
+                value=s.get('out', str(out_dir(TOOL_NAME) / 'collision')))
+            self.sections_var = tk.StringVar(value=s.get('sections', ''))
+            self.offset_var = tk.StringVar(value=str(s.get('offset', DEFAULT_VERTICAL_OFFSET)))
+            self.strips_var = tk.BooleanVar(value=s.get('strips', True))
+            self.walls_var = tk.BooleanVar(value=s.get('walls', True))
+            self.double_var = tk.BooleanVar(value=s.get('double', True))
+            self.status_var = tk.StringVar(value='Ready')
+            self.events = queue.Queue()
+            self.busy = False
+            self._build()
+            self.after(100, self._poll)
+
+        def _build(self):
+            body = ttk.Frame(self, padding=10)
+            body.pack(fill=tk.BOTH, expand=True)
+            body.columnconfigure(1, weight=1)
+            body.rowconfigure(5, weight=1)
+
+            def path_row(row, label, var, command):
+                ttk.Label(body, text=label).grid(row=row, column=0, sticky='w', pady=2)
+                ttk.Entry(body, textvariable=var).grid(row=row, column=1, sticky='ew', padx=6)
+                ttk.Button(body, text='Browse...', command=command).grid(row=row, column=2)
+
+            path_row(0, 'Stream file', self.stream_var,
+                     lambda: self._pick(self.stream_var, 'Stream file (STREAML5RA.BUN)'))
+            path_row(1, 'Region file (group keys, optional)', self.region_var,
+                     lambda: self._pick(self.region_var, 'Region file (L5RA.BUN)'))
+            path_row(2, 'Output folder', self.out_var, self._pick_folder)
+
+            options = ttk.LabelFrame(body, text='Options', padding=8)
+            options.grid(row=3, column=0, columnspan=3, sticky='ew', pady=8)
+            ttk.Label(options, text='Sections (blank = all, e.g. 1021, 1100-1110)').grid(
+                row=0, column=0, sticky='w')
+            ttk.Entry(options, textvariable=self.sections_var, width=24).grid(
+                row=0, column=1, sticky='w', padx=6)
+            ttk.Label(options, text='Vertical offset').grid(row=1, column=0, sticky='w', pady=2)
+            ttk.Entry(options, textvariable=self.offset_var, width=8).grid(
+                row=1, column=1, sticky='w', padx=6)
+            ttk.Checkbutton(options, text='Triangle strips (surfaces)',
+                            variable=self.strips_var).grid(row=2, column=0, sticky='w')
+            ttk.Checkbutton(options, text='Barrier walls (edges stood up as quads)',
+                            variable=self.walls_var).grid(row=3, column=0, sticky='w')
+            ttk.Checkbutton(options, text='Walls double-sided (adds a flipped copy)',
+                            variable=self.double_var).grid(row=4, column=0, sticky='w')
+
+            actions = ttk.Frame(body)
+            actions.grid(row=4, column=0, columnspan=3, sticky='ew')
+            actions.columnconfigure(1, weight=1)
+            self.export_button = ttk.Button(actions, text='Export', command=self._on_export)
+            self.export_button.grid(row=0, column=0)
+            self.progress = ttk.Progressbar(actions, mode='determinate')
+            self.progress.grid(row=0, column=1, sticky='ew', padx=8)
+            ttk.Label(actions, textvariable=self.status_var, width=24).grid(row=0, column=2)
+
+            log_frame = ttk.Frame(body)
+            log_frame.grid(row=5, column=0, columnspan=3, sticky='nsew', pady=(8, 0))
+            log_frame.columnconfigure(0, weight=1)
+            log_frame.rowconfigure(0, weight=1)
+            self.log_text = tk.Text(log_frame, height=10, state='disabled', wrap='word')
+            scroll = ttk.Scrollbar(log_frame, command=self.log_text.yview)
+            self.log_text.configure(yscrollcommand=scroll.set)
+            self.log_text.grid(row=0, column=0, sticky='nsew')
+            scroll.grid(row=0, column=1, sticky='ns')
+
+        def _pick(self, var, title):
+            path = filedialog.askopenfilename(title=title, initialdir=os.path.dirname(var.get()) or None)
+            if path:
+                var.set(path)
+
+        def _pick_folder(self):
+            path = filedialog.askdirectory(title='Output folder', initialdir=self.out_var.get() or None)
+            if path:
+                self.out_var.set(path)
+
+        def _log(self, text):
+            self.log_text.configure(state='normal')
+            self.log_text.insert(tk.END, text + '\n')
+            self.log_text.see(tk.END)
+            self.log_text.configure(state='disabled')
+
+        def _on_export(self):
+            if self.busy:
+                return
+            try:
+                params = {'stream_path': self.stream_var.get().strip(),
+                          'out_folder': self.out_var.get().strip(),
+                          'region_path': self.region_var.get().strip() or None,
+                          'sections': parse_section_filter(self.sections_var.get()),
+                          'strips': self.strips_var.get(), 'walls': self.walls_var.get(),
+                          'double_sided_walls': self.double_var.get(),
+                          'vertical_offset': float(self.offset_var.get())}
+            except ValueError:
+                messagebox.showerror('Collision DAE export',
+                                     'Sections or vertical offset is not a number.')
+                return
+            if not os.path.isfile(params['stream_path']):
+                messagebox.showerror('Collision DAE export', 'Choose the stream file first.')
+                return
+            if params['region_path'] and not os.path.isfile(params['region_path']):
+                messagebox.showerror('Collision DAE export', 'The region file does not exist.')
+                return
+            if not params['out_folder']:
+                messagebox.showerror('Collision DAE export', 'Choose an output folder.')
+                return
+            if not (params['strips'] or params['walls']):
+                messagebox.showerror('Collision DAE export', 'Enable strips or walls.')
+                return
+            self._save_settings()
+            self.busy = True
+            self.export_button.state(['disabled'])
+            self.progress.configure(value=0)
+            self.status_var.set('Loading stream file...')
+            threading.Thread(target=self._work, args=(params,), daemon=True).start()
+
+        def _save_settings(self):
+            data = {'stream': self.stream_var.get(), 'region': self.region_var.get(),
+                    'out': self.out_var.get(), 'sections': self.sections_var.get(),
+                    'offset': self.offset_var.get(), 'strips': self.strips_var.get(),
+                    'walls': self.walls_var.get(), 'double': self.double_var.get()}
+            try:
+                _settings_path().write_text(json.dumps(data, indent=1), encoding='utf-8')
+            except OSError:
+                pass
+
+        def _work(self, params):
+            try:
+                export_collision(
+                    log=lambda text: self.events.put(('log', text)),
+                    progress=lambda phase, done, total: self.events.put(('progress', (phase, done, total))),
+                    **params)
+                self.events.put(('done', None))
+            except Exception as exc:    # shown in the window, the log keeps the details
+                self.events.put(('error', f"{type(exc).__name__}: {exc}"))
+
+        def _poll(self):
+            try:
+                while True:
+                    kind, value = self.events.get_nowait()
+                    if kind == 'log':
+                        self._log(value)
+                    elif kind == 'progress':
+                        phase, done, total = value
+                        self.progress.configure(maximum=max(total, 1), value=done)
+                        self.status_var.set(f"{phase} {done}/{total}")
+                    elif kind in ('done', 'error'):
+                        if kind == 'error':
+                            self._log('Error: ' + value)
+                        self.status_var.set('Done' if kind == 'done' else 'Failed')
+                        self.busy = False
+                        self.export_button.state(['!disabled'])
+            except queue.Empty:
+                pass
+            self.after(100, self._poll)
+
+    App().mainloop()
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        description="Export the collision packs of the stream file as DAE files (no argument "
+                    "opens the window).")
+    ap.add_argument('stream_bun', nargs='?', help="stream file (STREAML5RA.BUN)")
+    ap.add_argument('--out', help="output folder (default outputs/nfs_collision_dae/collision/)")
+    ap.add_argument('--region-bun', metavar='REGION',
+                    help="region file (L5RA.BUN): writes the group key of each group shape to "
+                         "collision_index.json")
+    ap.add_argument('--sections', default='', help="section numbers, e.g. 1021,1100-1110 (default all)")
+    ap.add_argument('--vertical-offset', type=float, default=DEFAULT_VERTICAL_OFFSET,
+                    help=f"added to the height once (default {DEFAULT_VERTICAL_OFFSET:g})")
+    ap.add_argument('--no-strips', action='store_true', help="skip the triangle strips")
+    ap.add_argument('--no-walls', action='store_true', help="skip the barrier walls")
+    ap.add_argument('--single-sided-walls', action='store_true', help="no flipped copy of the walls")
+    args = ap.parse_args(argv)
+    if not args.stream_bun:
+        run_window()
+        return
+    if args.no_strips and args.no_walls:
+        ap.error("--no-strips and --no-walls together leave nothing to export")
+    out = args.out or str(out_dir(TOOL_NAME) / 'collision')
+    export_collision(args.stream_bun, out, args.region_bun, parse_section_filter(args.sections),
+                     not args.no_strips, not args.no_walls, not args.single_sided_walls,
+                     args.vertical_offset, log=lambda text: print(f"[{TOOL_NAME}] {text}"))
+
+
+if __name__ == '__main__':
+    main()
