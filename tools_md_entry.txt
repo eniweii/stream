@@ -1,0 +1,6 @@
+Add these entries to tools.md after integrating the files:
+
+`region/traffic_corridors.py` | Convert the already-parsed CARP / WRoadNetwork into per-profile-zone lane corridors; applies classification mappings, reusable patterns, local overrides, outputs BeamNG-space nodes, and builds Zone-mode profile geometry, harmonizes endpoints by source node/raw profile-zone ID, and stitches connected lane zones into continuous node-array roads.
+`beamng/traffic_node_exporter.py` | Write Zone-derived continuous traffic roads as line-delimited BeamNG DecalRoad objects, applying the configurable +150 m Z placement offset exactly once, plus a source manifest.
+`viewers/traffic_node_editor.py` | Standalone Tkinter Traffic Node Editor & Exporter; reuses nfs_carp_parser, previews profile zones/corridors/direction/junction candidates, edits mappings and overrides, persists overObjects, manages patterns, validates, and exports Zone-mode geometry.
+`tests/test_traffic_corridors.py` | Synthetic tests for orientation, direction, override/pattern precedence, corridor stitching, overObjects, and line-delimited DecalRoad export.
