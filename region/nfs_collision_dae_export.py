@@ -18,15 +18,25 @@ inside the polygon of its own section, checked against sections.json).
 
 Geometry of an article (CollisionArticle) is read the way nfs_collision_pack.write_collision_obj
 reads it:
-    strips  triangle strips: N vertices give N - 2 triangles, odd triangles swap the first two
-            vertices so the winding stays the same
-    edges   barrier walls: two points and a bottom and top height, no surface. Each edge is
-            stood up as a quad (2 triangles) between YBot and YTop. Many articles have only
-            edges, so without this step they would be missing from the DAE
+    strips  triangle strips: N vertices give N - 2 triangles. Odd triangles swap the first two
+            vertices to normalize strip parity. Face orientation then mirrors the game's
+            CalcCollisionFaceNormal: after NFS-to-BeamNG conversion, reverse a face only when
+            its NFS-Y / BeamNG-Z normal component is negative. Do not read kUpFacing as a
+            blanket instruction to force each triangle up or down.
+    edges   barrier walls: each source edge becomes a quad (2 triangles) between YBot and
+            YTop. Winding is aligned with WCollisionBarrier::GetNormal after the BeamNG axis
+            mapping. Optional double-sided mode adds exactly overlapping reverse-wound faces;
+            this is off by default because it causes conflicting viewport normals.
 World position of a vertex: nfs_collision_pack.local_to_world (instance matrix rows and true
 position). Then NFS (x, y, z) -> BeamNG (z, -x, y + vertical offset), the same mapping as
 region/export_sections.py and the traffic node exporter; the vertical offset (default 150) is
-applied here once. The mapping flips handedness, the triangle order is kept as read.
+applied here once. Triangle-strip parity is normalized after conversion. Face orientation then
+follows WCollisionMgr.cpp::CalcCollisionFaceNormal: reverse a face only when its vertical
+normal component is negative (NFS +Y maps to BeamNG +Z). This avoids treating kUpFacing as a
+blanket instruction to force every face up or down.
+
+Streaming note: collision is not streamed as ordinary section geometry. Group-0/base collision
+is static; only nonzero-group collision follows group/override triggers.
 
 Per shape, equal vertices (rounded to 0.1 mm) are welded and each triangle gets one flat
 normal.
@@ -150,7 +160,7 @@ def parse_section_filter(text):
     return numbers
 
 
-def build_shapes(packs, sections=None, strips=True, walls=True, double_sided_walls=True,
+def build_shapes(packs, sections=None, strips=True, walls=True, double_sided_walls=False,
                  vertical_offset=DEFAULT_VERTICAL_OFFSET, progress=None, names=None):
     """One Shape per (section, group number). Returns (shapes, stats). shapes is sorted by
     section, then group (base first). names is {vlt hash: surface name} (default: the VLT
@@ -185,10 +195,21 @@ def build_shapes(packs, sections=None, strips=True, walls=True, double_sided_wal
                               for v in strip.vertices]
                     for t in range(len(points) - 2):
                         a, b, c = points[t], points[t + 1], points[t + 2]
+                        # WCollisionStrip::MakeNextFace slides the vertex window. For an
+                        # independent triangle mesh, swap the first two vertices on odd
+                        # triangles to normalize triangle-strip parity.
+                        if t & 1:
+                            a, b = b, a
+                        # Mirror WCollisionMgr.cpp::CalcCollisionFaceNormal: the game's
+                        # computed normal is flipped only when its NFS-Y component is negative.
+                        # NFS +Y maps to BeamNG +Z. kUpFacing participates in collision-test
+                        # side selection; it is not a per-face +/-Z normal instruction.
+                        normal_z = _normal(a, b, c)[2]
+                        if normal_z < 0.0:
+                            b, c = c, b
                         surface = surface_of(article, strip.surfaces[t] if t < len(strip.surfaces)
                                              else len(article.surface_hashes))
-                        ok = (shape.add_triangle(a, b, c, surface) if t % 2 == 0
-                              else shape.add_triangle(b, a, c, surface))
+                        ok = shape.add_triangle(a, b, c, surface)
                         if ok:
                             shape.strip_triangles += 1
                         else:
@@ -206,11 +227,28 @@ def build_shapes(packs, sections=None, strips=True, walls=True, double_sided_wal
                     p2 = to_beamng((b[0], y_top, b[2]), vertical_offset)
                     p3 = to_beamng((a[0], y_top, a[2]), vertical_offset)
                     surface = surface_of(article, edge.surface)
-                    added = (shape.add_triangle(p0, p1, p2, surface)
-                             + shape.add_triangle(p0, p2, p3, surface))
+
+                    # Match WCollisionBarrier::GetNormal in WCollision.h. In NFS space
+                    # the barrier normal is (delta_z, 0, -delta_x); after the NFS -> BeamNG
+                    # mapping (z, -x, y), its horizontal direction is (-delta_x, -delta_z, 0).
+                    # Edge endpoint order can vary, so pick the triangle winding from that target
+                    # normal instead of assuming the source endpoints always have one ordering.
+                    expected_normal = (-(b[0] - a[0]), -(b[2] - a[2]), 0.0)
+                    raw_normal = _normal(p0, p1, p2)[:3]
+                    facing_dot = sum(raw_normal[i] * expected_normal[i] for i in range(3))
+                    if facing_dot < 0.0:
+                        wall_triangles = ((p0, p2, p1), (p0, p3, p2))
+                    else:
+                        wall_triangles = ((p0, p1, p2), (p0, p2, p3))
+
+                    added = sum(shape.add_triangle(ta, tb, tc, surface)
+                                for ta, tb, tc in wall_triangles)
                     if double_sided_walls:
-                        added += (shape.add_triangle(p0, p2, p1, surface)
-                                  + shape.add_triangle(p0, p3, p2, surface))
+                        # These reverse-wound copies are exactly coplanar with the front faces;
+                        # keep the option for special cases but don't enable it by default, since
+                        # Blender's viewport can show overlapping/opposite normal artifacts.
+                        added += sum(shape.add_triangle(ta, tc, tb, surface)
+                                     for ta, tb, tc in wall_triangles)
                     if added:
                         shape.wall_quads += 1
                     else:
@@ -351,7 +389,7 @@ def _write_material_list(out_folder, index):
 
 
 def export_collision(stream_path, out_folder, region_path=None, sections=None, strips=True,
-                     walls=True, double_sided_walls=True,
+                     walls=True, double_sided_walls=False,
                      vertical_offset=DEFAULT_VERTICAL_OFFSET, log=print, progress=None, names=None):
     """Writes every shape as a DAE plus collision_index.json and
     collision_surface_materials.json to out_folder. Returns a summary dict. log(text) and
@@ -402,6 +440,9 @@ def export_collision(stream_path, out_folder, region_path=None, sections=None, s
     manifest = {'tool': TOOL_NAME, 'stream': os.path.abspath(stream_path),
                 'region': os.path.abspath(region_path) if region_path else None,
                 'coordinateMapping': 'NFS (x,y,z) -> BeamNG (z,-x,y+verticalOffset)',
+                'windingPolicy': 'strip parity + game CalcCollisionFaceNormal rule + barrier GetNormal',
+                'streamingPolicy': {'baseCollision': 'static_not_streamed',
+                                    'groupCollision': 'group_triggered_only'},
                 'verticalOffset': vertical_offset,
                 'options': {'strips': strips, 'walls': walls, 'doubleSidedWalls': double_sided_walls,
                             'sections': sorted(sections) if sections else 'all'},
@@ -449,7 +490,9 @@ def run_window():
             self.offset_var = tk.StringVar(value=str(s.get('offset', DEFAULT_VERTICAL_OFFSET)))
             self.strips_var = tk.BooleanVar(value=s.get('strips', True))
             self.walls_var = tk.BooleanVar(value=s.get('walls', True))
-            self.double_var = tk.BooleanVar(value=s.get('double', True))
+            # Ignore the legacy 'double' setting once: older versions saved True by default,
+            # which creates coincident reverse-wound wall faces. Persist the new choice separately.
+            self.double_var = tk.BooleanVar(value=s.get('double_sided_walls_v2', False))
             self.status_var = tk.StringVar(value='Ready')
             self.events = queue.Queue()
             self.busy = False
@@ -486,7 +529,8 @@ def run_window():
                             variable=self.strips_var).grid(row=2, column=0, sticky='w')
             ttk.Checkbutton(options, text='Barrier walls (edges stood up as quads)',
                             variable=self.walls_var).grid(row=3, column=0, sticky='w')
-            ttk.Checkbutton(options, text='Walls double-sided (adds a flipped copy)',
+            ttk.Checkbutton(options,
+                            text='Double-sided walls (adds overlapping reverse faces; optional)',
                             variable=self.double_var).grid(row=4, column=0, sticky='w')
 
             actions = ttk.Frame(body)
@@ -562,7 +606,8 @@ def run_window():
             data = {'stream': self.stream_var.get(), 'region': self.region_var.get(),
                     'out': self.out_var.get(), 'sections': self.sections_var.get(),
                     'offset': self.offset_var.get(), 'strips': self.strips_var.get(),
-                    'walls': self.walls_var.get(), 'double': self.double_var.get()}
+                    'walls': self.walls_var.get(),
+                    'double_sided_walls_v2': self.double_var.get()}
             try:
                 _settings_path().write_text(json.dumps(data, indent=1), encoding='utf-8')
             except OSError:
@@ -616,7 +661,12 @@ def main(argv=None):
     ap.add_argument('--hashes', help="wordlist for the surface names (default common/hashes_main.txt)")
     ap.add_argument('--no-strips', action='store_true', help="skip the triangle strips")
     ap.add_argument('--no-walls', action='store_true', help="skip the barrier walls")
-    ap.add_argument('--single-sided-walls', action='store_true', help="no flipped copy of the walls")
+    wall_sides = ap.add_mutually_exclusive_group()
+    wall_sides.add_argument('--double-sided-walls', dest='double_sided_walls', action='store_true',
+                            help='add overlapping reverse-wound copies of each barrier quad')
+    wall_sides.add_argument('--single-sided-walls', dest='double_sided_walls', action='store_false',
+                            help=argparse.SUPPRESS)  # backward-compatible; single-sided is default
+    ap.set_defaults(double_sided_walls=False)
     args = ap.parse_args(argv)
     if not args.stream_bun:
         run_window()
@@ -625,7 +675,7 @@ def main(argv=None):
         ap.error("--no-strips and --no-walls together leave nothing to export")
     out = args.out or str(out_dir(TOOL_NAME) / 'collision')
     export_collision(args.stream_bun, out, args.region_bun, parse_section_filter(args.sections),
-                     not args.no_strips, not args.no_walls, not args.single_sided_walls,
+                     not args.no_strips, not args.no_walls, args.double_sided_walls,
                      args.vertical_offset, log=lambda text: print(f"[{TOOL_NAME}] {text}"),
                      names=load_vlt_dictionary(args.hashes) if args.hashes else None)
 
