@@ -80,18 +80,76 @@ def get_oriented_zone(profile, logical_index, inverted):
     middle = n - int(profile.middleZone) if inverted else int(profile.middleZone)
     middle = max(0, min(n, middle))
     width = abs(float(profile.lane_width(raw_index)))
-    offset_magnitude = abs(float(profile.lane_offset(raw_index)))
+    raw_offset = float(profile.lane_offset(raw_index))
     is_left = logical_index < middle
-    # Profile offsets are stored as magnitudes. Side is determined by zone order.
+    # Same rule as the game's WRoadProfile::GetRelativeLaneOffset: the stored offset
+    # is signed and only lanes left of the middle zone are negated. Positive-only
+    # profiles come out as before; signed profiles (e.g. a one-carriageway profile
+    # with middleZone 0) keep their real lateral positions instead of being
+    # collapsed onto each other by abs().
+    offset = -raw_offset if is_left else raw_offset
     return {
         "logical_index": logical_index,
         "raw_index": raw_index,
         "type": int(profile.lane_type(raw_index)),
         "width": max(0.05, width),
-        "offset": -offset_magnitude if is_left else offset_magnitude,
+        "offset": offset,
         "side": "left" if is_left else "right",
         "middle_zone": middle,
     }
+
+
+TRAFFIC_LANE_TYPE = 1  # kLaneTraffic in the game's WRoadNav::ELaneType
+
+
+def pair_oriented_zones(pa, pb, start_inverted, end_inverted):
+    """Pair zones across a segment: returns [(zone_key, index_at_start, index_at_end)].
+
+    Same-structure profiles keep the plain same-index pairing. When the two ends
+    differ (zone count, side of middleZone or traffic/non-traffic zones) the zones
+    are paired like the game does at nodes: per direction group (side of middleZone),
+    nth traffic lane counted from the middle outward. Extra traffic lanes on the
+    larger end clamp onto the last lane of the smaller end (lanes merge); a lane
+    never pairs with a lane of the other direction, and a group that is empty at
+    one end produces nothing. Non-traffic zones pair in the same order without
+    clamping. zone_key is unique per segment and equals the start index for the
+    normal one-to-one pairs, so saved overrides keep their keys.
+    """
+    na, nb = int(pa.numZones), int(pb.numZones)
+    zones_a = [get_oriented_zone(pa, i, start_inverted) for i in range(na)]
+    zones_b = [get_oriented_zone(pb, i, end_inverted) for i in range(nb)]
+    zones_a = [z for z in zones_a if z is not None]
+    zones_b = [z for z in zones_b if z is not None]
+
+    def is_traffic(zone):
+        return zone["type"] == TRAFFIC_LANE_TYPE
+
+    if na == nb and all(a["side"] == b["side"] and is_traffic(a) == is_traffic(b)
+                        for a, b in zip(zones_a, zones_b)):
+        return [(i, i, i) for i in range(na)]
+
+    def group(zones, side, traffic):
+        picked = [z["logical_index"] for z in zones if z["side"] == side and is_traffic(z) == traffic]
+        return list(reversed(picked)) if side == "left" else picked  # middle outward
+
+    raw_pairs = []
+    for side in ("right", "left"):
+        for traffic in (True, False):
+            la, lb = group(zones_a, side, traffic), group(zones_b, side, traffic)
+            if not la or not lb:
+                continue
+            count = max(len(la), len(lb)) if traffic else min(len(la), len(lb))
+            for k in range(count):
+                raw_pairs.append((la[min(k, len(la) - 1)], lb[min(k, len(lb) - 1)]))
+    raw_pairs.sort()
+    used, next_key, pairs = set(), max(na, nb), []
+    for ia, ib in raw_pairs:
+        key = ia
+        if key in used:
+            key, next_key = next_key, next_key + 1
+        used.add(key)
+        pairs.append((key, ia, ib))
+    return pairs
 
 
 def segment_bezier_points(network, segment):
@@ -170,8 +228,8 @@ def expand_pattern_overrides(network, patterns):
             continue
         flags = segment_flags(seg)
         inv_a, inv_b = bool(flags & FLAG_START_INVERTED), bool(flags & FLAG_END_INVERTED)
-        for zi in range(min(int(pa.numZones), int(pb.numZones))):
-            za, zb = get_oriented_zone(pa, zi, inv_a), get_oriented_zone(pb, zi, inv_b)
+        for zi, ia, ib in pair_oriented_zones(pa, pb, inv_a, inv_b):
+            za, zb = get_oriented_zone(pa, ia, inv_a), get_oriented_zone(pb, ib, inv_b)
             if za is None or zb is None:
                 continue
             for pattern in patterns:
@@ -233,17 +291,18 @@ def build_corridors(network, type_rules=None, overrides=None, *, patterns=None, 
         inv_a, inv_b = bool(flags & FLAG_START_INVERTED), bool(flags & FLAG_END_INVERTED)
         # Source zone topology can change at a node; common logical indices are the
         # safe default. The mismatch is reported so the editor can review it.
-        count = min(int(pa.numZones), int(pb.numZones))
+        zone_pairs = pair_oriented_zones(pa, pb, inv_a, inv_b)
         if pa.numZones != pb.numZones:
             zone_mismatches += 1
             warnings.append({"kind": "profile_zone_count_mismatch", "segment": seg_i,
                              "start_count": pa.numZones, "end_count": pb.numZones,
-                             "message": "Only corresponding zone indices at both endpoints are generated."})
+                             "message": "Zones are paired per direction group (nth traffic lane from the "
+                                        "middle outward); extra traffic lanes merge into the last lane."})
         samples = sample_segment(network, seg, curve_steps)
         one_way_source = bool(flags & FLAG_ONE_WAY)
 
-        for zi in range(count):
-            za, zb = get_oriented_zone(pa, zi, inv_a), get_oriented_zone(pb, zi, inv_b)
+        for zi, ia, ib in zone_pairs:
+            za, zb = get_oriented_zone(pa, ia, inv_a), get_oriented_zone(pb, ib, inv_b)
             if za is None or zb is None:
                 continue
             rule_a = rules.get(str(za["type"]), rules["0"])

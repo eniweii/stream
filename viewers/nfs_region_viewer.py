@@ -17,7 +17,7 @@ Layout:
                  decides which layer is drawn on top: Raise / Lower move the
                  active layer. Switching mode, layers or order never moves the
                  viewport; only Fit to view and opening a region file do
-  Export tab     sections.json (needs the region file and a stream file).
+  Export tab     sections.json (needs the region file and a stream file), zones.json (region file only).
                  The road node export will come here
 
 Sections: yellow polygons (orange with a non-zero elevationHash) labeled with
@@ -47,7 +47,8 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from nfs_region_parser import load_region_file, GAME_PARSERS, get_label_functions
-from export_sections import build_sections, write_sections_json
+from export_sections import build_sections, build_elevation_polys, write_sections_json
+from export_zones import build_zones, count_by_type, write_zones_json
 from nfs_region_common import section_letter as _default_section_letter
 from nfs_region_common import format_section_label as _default_format_section_label
 from nfs_region_common import section_subsection
@@ -291,6 +292,14 @@ class RegionViewerApp(tk.Tk):
                       "list, for the runtime streamer. Needs a region file and a stream file.").pack(anchor="w")
         tk.Button(sections_box, text="Export sections.json...",
                    command=self.export_sections_json).pack(anchor="w", pady=(6, 0))
+
+        zones_box = tk.LabelFrame(parent, text="zones.json", padx=10, pady=8)
+        zones_box.pack(side=tk.TOP, fill=tk.X, padx=10, pady=4)
+        tk.Label(zones_box, anchor="w", justify=tk.LEFT,
+                 text="Every TrackPathZone of every type (tunnel, hidden, traffic pattern, no cop spawn,\n"
+                      "streamer prediction, ...) as a table for the runtime streamer. Needs a region file.").pack(anchor="w")
+        tk.Button(zones_box, text="Export zones.json...",
+                   command=self.export_zones_json).pack(anchor="w", pady=(6, 0))
 
         nodes_box = tk.LabelFrame(parent, text="Road nodes", padx=10, pady=8)
         nodes_box.pack(side=tk.TOP, fill=tk.X, padx=10, pady=4)
@@ -1868,7 +1877,9 @@ class RegionViewerApp(tk.Tk):
         sections are pulled in only via a drivable section's related list,
         never tested directly. A related ID is kept if it has a boundary OR
         stream data (a section with stream data but no boundary is real and
-        must stay); only IDs with neither are dropped as non-existent."""
+        must stay); only IDs with neither are dropped as non-existent.
+        Also writes each section's depth (stacked) sections and the elevation
+        triangles that choose between them, see export_sections.py."""
         if self.world is None:
             messagebox.showerror("Export sections.json", "No region file loaded.")
             return
@@ -1891,11 +1902,37 @@ class RegionViewerApp(tk.Tk):
             filetypes=[("JSON", "*.json")])
         if not path:
             return
-        write_sections_json(sections, path)
+        polys = build_elevation_polys(self.world)
+        write_sections_json(sections, path, polys)
+        with_depth = sum(1 for s in sections if 'depth' in s)
         messagebox.showinfo(
             "Export sections.json",
             f"Wrote {len(sections)} drivable sections to {path}\n"
+            f"{with_depth} have depth sections, {len(polys)} elevation triangles written.\n"
             f"{len(boundaryless_kept)} related sections have stream data but no boundary (kept).")
+
+    def export_zones_json(self):
+        """Writes zones.json for the runtime streamer: every TrackPathZone of
+        every type, in the same raw region plane as sections.json. Barriers are
+        not written. Needs only the region file."""
+        if self.world is None:
+            messagebox.showerror("Export zones.json", "No region file loaded.")
+            return
+        tp = self.world.track_paths
+        if not tp or not tp.zones:
+            messagebox.showwarning("Export zones.json", "No track path zones in this file - nothing to export.")
+            return
+
+        zones = build_zones(tp)
+
+        path = filedialog.asksaveasfilename(
+            title="Export zones.json", defaultextension=".json",
+            initialfile="zones.json", filetypes=[("JSON", "*.json")])
+        if not path:
+            return
+        write_zones_json(zones, path)
+        per_type = "\n".join(f"  {name}: {n}" for name, n in count_by_type(zones))
+        messagebox.showinfo("Export zones.json", f"Wrote {len(zones)} zones to {path}\n{per_type}")
 
     # Section info categories that start collapsed (long lists). Every other
     # category starts open. The choice is kept between clicks in self.info_open.
