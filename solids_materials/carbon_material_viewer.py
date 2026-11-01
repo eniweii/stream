@@ -88,8 +88,11 @@ def to_int(hex_text):
 
 
 def is_zero_scroll(sc):
-    """Smooth or snap scroll with speed 0 and 0 does not move."""
+    """Smooth or snap scroll with speed 0, 0 and no timestep does not move.
+    With a timestep it still moves in game (timestepDriven), so it is kept."""
     if not sc or sc.get("type") == "OffsetScale":
+        return False
+    if sc.get("timestepDriven") or sc.get("rawTimeStep"):
         return False
     s = sc.get("rawSpeedS", sc.get("speedS"))
     t = sc.get("rawSpeedT", sc.get("speedT"))
@@ -599,6 +602,8 @@ class PreviewPanel(ttk.Frame):
                 off = [sign * vals[0], sign * vals[1]]
                 lines.append(f"{scroll_text(rec)}  offset=({off[0]:+.3f}, {off[1]:+.3f})"
                              + ("  (S/T swapped)" if swap else ""))
+                if sc.get("timestepDriven"):
+                    lines.append("Timestep-driven (speed 0/0): moves in game, not shown here (decode pending).")
                 if sc["type"] == "Snap":
                     # Extend the view one texture toward the direction the image moves.
                     lo, hi, moved = [0.0, 0.0], [1.0, 1.0], False

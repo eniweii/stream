@@ -20,6 +20,9 @@ from tkinter import filedialog, scrolledtext, messagebox
 from datetime import datetime
 
 FILENAME_RE = re.compile(r'^0x[0-9A-Fa-f]{8}_(?P<basename>.+)_(?P<suffix>REF|AO|[DNMROASIE])(?:\.[^.]+)?$', re.IGNORECASE)
+# A file with a hash prefix but no recognised role suffix is the diffuse (e.g. the _ANIM001 frames).
+BARE_FILENAME_RE = re.compile(r'^0x[0-9A-Fa-f]{8}_(?P<basename>.+?)(?:\.[^.]+)?$', re.IGNORECASE)
+HASH_RE = re.compile(r'0x([0-9A-Fa-f]{8})_')
 
 ROLE_NAMES = {
     'D': 'diffuse', 'N': 'normal', 'M': 'metal', 'R': 'rough', 'O': 'opacity',
@@ -38,6 +41,12 @@ ROLE_STAGE_FIELD = {
 }
 
 USE_UV_FIELD_OVERRIDES = {'baseColorMap': 'diffuseMapUseUV'}
+
+# --- animations (Populate animations button) ---
+SCROLL_ANIM_FLAG = 4          # animFlags value for a scroll, taken from a stage saved in the Material Editor
+SCROLL_SPEED_VALUE = 1.0      # scrollDir carries the per-axis speed (cycles per second), so scrollSpeed stays 1
+TIMESTEP_RAW_PER_SECOND = 6552.0   # ESTIMATE: raw timestep 1638 was seen at about 0.25 s per step in game
+ANIMATIONS_JSON_NAME = 'material_animations.json'
 
 ALL_MAP_FIELDS = list(ROLE_STAGE_FIELD.values())
 FIELD_TO_ROLE = {field: role for role, field in ROLE_STAGE_FIELD.items()}
@@ -140,10 +149,15 @@ def normalize_use_uv(stage, stage_index):
 
 
 def parse_filename(filename):
+    """Returns (base name, role, implied). implied is True when no role suffix was found and
+    the file is taken as the diffuse."""
     match = FILENAME_RE.match(filename)
-    if not match:
-        return None
-    return match.group('basename'), ROLE_NAMES[match.group('suffix').upper()]
+    if match:
+        return match.group('basename'), ROLE_NAMES[match.group('suffix').upper()], False
+    bare = BARE_FILENAME_RE.match(filename)
+    if bare:
+        return bare.group('basename'), 'diffuse', True
+    return None
 
 
 def derive_base_name(base_color_map_path):
@@ -151,10 +165,7 @@ def derive_base_name(base_color_map_path):
         return None
     filename = base_color_map_path.replace('\\', '/').rsplit('/', 1)[-1]
     parsed = parse_filename(filename)
-    if parsed:
-        return parsed[0]
-    bare = re.match(r'^0x[0-9A-Fa-f]{8}_(?P<basename>.+?)(?:\.[^.]+)?$', filename)
-    return bare.group('basename') if bare else None
+    return parsed[0] if parsed else None
 
 
 def opacity_variant_from_path(full_path):
@@ -211,11 +222,15 @@ def scan_texture_folder(root, log=print):
             parsed = parse_filename(filename)
             if not parsed:
                 continue
-            base_name, role = parsed
+            base_name, role, implied = parsed
             if role not in ROLE_STAGE_FIELD:
                 continue
             full_path = os.path.join(current_root, filename)
-            index.setdefault(base_name.lower(), {})[role] = full_path
+            roles = index.setdefault(base_name.lower(), {})
+            if implied:
+                roles.setdefault(role, full_path)   # an explicit _D file wins over a bare one
+            else:
+                roles[role] = full_path
     log(f"Scanned {file_count} file(s), matched {len(index)} distinct base name(s) under {root}")
     return index
 
@@ -417,6 +432,180 @@ def populate_materials(materials_data, texture_index, texture_root, base_prefix,
     return total_changes, len(touched_materials)
 
 
+def hash_from_path(path):
+    """0xAE651288 from a texture path or file name, or None."""
+    if not path or not isinstance(path, str):
+        return None
+    match = HASH_RE.match(path.replace('\\', '/').rsplit('/', 1)[-1])
+    return '0x' + match.group(1).upper() if match else None
+
+
+def stage_diffuse_hash(stage):
+    for field in ('baseColorMap', 'colorMap', 'diffuseMap'):
+        found = hash_from_path(stage.get(field))
+        if found:
+            return found
+    return None
+
+
+def scan_diffuse_by_hash(root, log=print):
+    """hash -> disk path of the diffuse file (a bare 0x<hash>_<name> file counts as diffuse)."""
+    found = {}
+    for current_root, _dirs, filenames in os.walk(root):
+        for filename in filenames:
+            parsed = parse_filename(filename)
+            file_hash = hash_from_path(filename)
+            if not parsed or not file_hash or parsed[1] != 'diffuse':
+                continue
+            if parsed[2]:
+                found.setdefault(file_hash, os.path.join(current_root, filename))
+            else:
+                found[file_hash] = os.path.join(current_root, filename)
+    log(f"Found {len(found)} diffuse texture file(s) by hash under {root}")
+    return found
+
+
+def scroll_axes(sc, swap_st, invert):
+    """Scroll speeds as (U, V) in cycles per second. The viewer rule: with swap, S drives the
+    vertical axis and T the horizontal axis."""
+    raw_s = sc.get('rawSpeedS')
+    raw_t = sc.get('rawSpeedT')
+    speed_s = raw_s / 4096.0 if raw_s is not None else (sc.get('speedS') or 0.0)
+    speed_t = raw_t / 4096.0 if raw_t is not None else (sc.get('speedT') or 0.0)
+    axes = (speed_t, speed_s) if swap_st else (speed_s, speed_t)
+    sign = -1.0 if invert else 1.0
+    return sign * axes[0], sign * axes[1]
+
+
+def is_native_scroll(sc):
+    """Smooth scroll with a real speed: BeamNG can do it with animFlags + scrollDir."""
+    if not sc or sc.get('type') != 'Smooth' or sc.get('timestepDriven'):
+        return False
+    return bool(sc.get('rawSpeedS') or sc.get('rawSpeedT') or sc.get('speedS') or sc.get('speedT'))
+
+
+def clear_scroll_fields(stage):
+    changed = False
+    if isinstance(stage.get('animFlags'), int) and stage['animFlags'] & SCROLL_ANIM_FLAG:
+        stage['animFlags'] &= ~SCROLL_ANIM_FLAG
+        if stage['animFlags'] == 0:
+            del stage['animFlags']
+        changed = True
+    for key in ('scrollDir', 'scrollSpeed'):
+        if key in stage:
+            del stage[key]
+            changed = True
+    return changed
+
+
+def lua_entry_for(texture_hash, rec, frame_of, swap_st, invert):
+    """The material_animations.json entry for a texture that BeamNG cannot animate natively."""
+    entry = {'texture': texture_hash}
+    sc = rec.get('scroll')
+    fs = rec.get('frameSwap') or (
+        {'animation': frame_of[texture_hash][0], 'frame': frame_of[texture_hash][1]}
+        if texture_hash in frame_of else None)
+    if fs:
+        entry.update({'type': 'frame_swap', 'animation': fs['animation'], 'frame': fs['frame']})
+        return entry
+    if not sc or is_native_scroll(sc):
+        return None
+    if sc.get('type') == 'OffsetScale':
+        off = (sc.get('offsetS', 0.0), sc.get('offsetT', 0.0))
+        scale = (sc.get('scaleS', 0.0) or 1.0, sc.get('scaleT', 0.0) or 1.0)
+        if swap_st:
+            off, scale = off[::-1], scale[::-1]
+        entry.update({'type': 'offset_scale', 'offsetU': off[0], 'offsetV': off[1],
+                      'scaleU': scale[0], 'scaleV': scale[1]})
+        return entry
+    raw_step = sc.get('rawTimeStep') or 0
+    entry['type'] = 'snap' if sc.get('type') == 'Snap' else 'smooth'
+    entry['rawTimeStep'] = raw_step
+    entry['stepSecondsEstimate'] = abs(raw_step) / TIMESTEP_RAW_PER_SECOND if raw_step else None
+    if sc.get('timestepDriven'):
+        # Speed 0 and 0: the game moves it by its timestep, half a UV per step. The jump axis
+        # and direction are not decoded yet.
+        entry['timestepDriven'] = True
+        entry['direction'] = None
+    else:
+        u, v = scroll_axes(sc, swap_st, invert)
+        entry['speedU'], entry['speedV'] = u, v
+    return entry
+
+
+def populate_animations(materials_data, dictionary, diffuse_by_hash, texture_root, base_prefix,
+                        swap_st=True, invert=False, log=print):
+    """Writes animation data only. Smooth scrolls go on the stage (animFlags + scrollDir).
+    Everything else (snap, timestep-driven, offset/scale, frame swap) goes in the returned
+    lua data, so a lua middleman can drive it. Returns (changes, lua_data)."""
+    textures = dictionary.get('textures') or {}
+    animations = dictionary.get('animations') or {}
+
+    frame_of = {}
+    for akey, anim in animations.items():
+        for i, frame_hash in enumerate(anim.get('frames') or []):
+            frame_of.setdefault(frame_hash, (akey, i))
+
+    lua_animations = {}
+    for akey, anim in animations.items():
+        frames = []
+        for frame_hash in anim.get('frames') or []:
+            disk = diffuse_by_hash.get(frame_hash.upper().replace('0X', '0x'))
+            path = base_prefix + os.path.relpath(disk, texture_root).replace(os.sep, '/') if disk else None
+            if not path:
+                log(f"  frame {frame_hash} of {anim.get('name') or akey} has no texture file in the folder")
+            frames.append({'hash': frame_hash, 'path': path})
+        lua_animations[akey] = {'name': anim.get('name'), 'fps': anim.get('fps'),
+                                'timeBase': anim.get('timeBase'), 'frames': frames}
+
+    lua_materials = {}
+    native_count = cleared_count = lua_count = 0
+    touched = set()
+
+    for material_name, mat in materials_data.items():
+        for stage_index, stage in enumerate(mat.get('Stages') or []):
+            if not stage:
+                continue
+            texture_hash = stage_diffuse_hash(stage)
+            if not texture_hash:
+                continue
+            if texture_hash not in textures and texture_hash not in frame_of:
+                continue    # unknown to the dictionary: leave the stage alone
+            rec = dict(textures.get(texture_hash) or {})
+            sc = rec.get('scroll')
+
+            if is_native_scroll(sc) and not rec.get('frameSwap'):
+                u, v = scroll_axes(sc, swap_st, invert)
+                flags = stage.get('animFlags') if isinstance(stage.get('animFlags'), int) else 0
+                wanted = {'animFlags': flags | SCROLL_ANIM_FLAG, 'scrollDir': [u, v],
+                          'scrollSpeed': SCROLL_SPEED_VALUE}
+                if any(stage.get(k) != val for k, val in wanted.items()):
+                    stage.update(wanted)
+                    native_count += 1
+                    touched.add(material_name)
+            elif clear_scroll_fields(stage):
+                cleared_count += 1
+                touched.add(material_name)
+
+            entry = lua_entry_for(texture_hash, rec, frame_of, swap_st, invert)
+            if entry:
+                entry['stage'] = stage_index
+                lua_materials.setdefault(material_name, []).append(entry)
+                lua_count += 1
+
+    log(f"Smooth scroll set on {native_count} stage(s); stale scroll fields cleared on {cleared_count} stage(s)")
+    log(f"{lua_count} stage(s) in {len(lua_materials)} material(s) go to {ANIMATIONS_JSON_NAME}")
+    lua_data = {
+        'version': 1,
+        'notes': ('speedU/speedV are cycles per second after the S/T swap and invert settings. '
+                  'stepSecondsEstimate is an estimate: the timestep decode is not confirmed. '
+                  'Timestep-driven entries (speed 0 and 0) have no direction decoded yet.'),
+        'animations': lua_animations,
+        'materials': lua_materials,
+    }
+    return native_count + cleared_count, lua_data
+
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -425,6 +614,9 @@ class App:
         self.materials_path_var = tk.StringVar()
         self.texture_folder_var = tk.StringVar()
         self.base_prefix_var = tk.StringVar(value="")
+        self.dictionary_path_var = tk.StringVar()
+        self.swap_st_var = tk.BooleanVar(value=True)
+        self.invert_scroll_var = tk.BooleanVar(value=False)
 
         row = 0
         tk.Label(root, text="materials.json:").grid(row=row, column=0, sticky="e", padx=4, pady=4)
@@ -441,9 +633,22 @@ class App:
         tk.Entry(root, textvariable=self.base_prefix_var, width=70).grid(row=row, column=1, padx=4, sticky="w")
 
         row += 1
+        tk.Label(root, text="Material dictionary (animations only):").grid(row=row, column=0, sticky="e", padx=4, pady=4)
+        tk.Entry(root, textvariable=self.dictionary_path_var, width=70).grid(row=row, column=1, padx=4)
+        tk.Button(root, text="Browse", command=self._pick_dictionary).grid(row=row, column=2, padx=4)
+
+        row += 1
+        option_row = tk.Frame(root)
+        option_row.grid(row=row, column=1, sticky="w", padx=4)
+        tk.Checkbutton(option_row, text="Swap S/T", variable=self.swap_st_var).pack(side="left")
+        tk.Checkbutton(option_row, text="Invert scroll", variable=self.invert_scroll_var).pack(side="left", padx=8)
+
+        row += 1
         button_row = tk.Frame(root)
         button_row.grid(row=row, column=0, columnspan=3, pady=10)
         tk.Button(button_row, text="Populate", command=self.run_populate, bg="#3a6", fg="white", width=20
+                  ).pack(side="left", padx=6)
+        tk.Button(button_row, text="Populate animations", command=self.run_populate_animations, width=20
                   ).pack(side="left", padx=6)
         tk.Button(button_row, text="Validate Paths Only", command=self.run_validate_only, width=20
                   ).pack(side="left", padx=6)
@@ -464,6 +669,11 @@ class App:
             return
         if not self.base_prefix_var.get():
             self.base_prefix_var.set(detect_base_prefix(materials_data))
+
+    def _pick_dictionary(self):
+        path = filedialog.askopenfilename(filetypes=[("Material dictionary", "*.json"), ("All files", "*.*")])
+        if path:
+            self.dictionary_path_var.set(path)
 
     def _pick_texture_folder(self):
         path = filedialog.askdirectory()
@@ -564,6 +774,45 @@ class App:
         else:
             summary += f"\n\nAll {checked} checked path(s) resolve to a real file."
             messagebox.showinfo("Materials Populator", summary)
+
+    def run_populate_animations(self):
+        self._run_safely(self._do_populate_animations)
+
+    def _do_populate_animations(self):
+        dictionary_path = self.dictionary_path_var.get().strip()
+        if not dictionary_path or not os.path.isfile(dictionary_path):
+            messagebox.showerror("Materials Populator", "Pick the material dictionary json first.")
+            return
+        loaded = self._load_inputs()
+        if loaded is None:
+            return
+        materials_path, texture_root, base_prefix, materials_data = loaded
+
+        with open(dictionary_path, "r", encoding="utf-8") as f:
+            dictionary = json.load(f)
+        self.log(f"Loaded dictionary: {len(dictionary.get('textures') or {})} texture(s), "
+                 f"{len(dictionary.get('animations') or {})} animation(s)")
+
+        diffuse_by_hash = scan_diffuse_by_hash(texture_root, log=self.log)
+        changes, lua_data = populate_animations(
+            materials_data, dictionary, diffuse_by_hash, texture_root, base_prefix,
+            swap_st=self.swap_st_var.get(), invert=self.invert_scroll_var.get(), log=self.log)
+
+        if changes:
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+            backup_path = f"{materials_path}.{timestamp}.bak"
+            self.log(f"Writing backup to {backup_path} ...")
+            shutil.copy2(materials_path, backup_path)
+            with open(materials_path, "w", encoding="utf-8") as f:
+                json.dump(materials_data, f, indent=4)
+            self.log(f"Wrote {changes} stage change(s) to {materials_path}")
+        else:
+            self.log("No stage changes for materials.json.")
+
+        lua_path = os.path.join(os.path.dirname(materials_path), ANIMATIONS_JSON_NAME)
+        with open(lua_path, "w", encoding="utf-8") as f:
+            json.dump(lua_data, f, indent=2)
+        self.log(f"Wrote {lua_path}")
 
 
 if __name__ == "__main__":
