@@ -43,7 +43,7 @@ ROLE_STAGE_FIELD = {
 USE_UV_FIELD_OVERRIDES = {'baseColorMap': 'diffuseMapUseUV'}
 
 # --- animations (Populate animations button) ---
-SCROLL_ANIM_FLAG = 4          # animFlags value for a scroll, taken from a stage saved in the Material Editor
+SCROLL_ANIM_FLAG = 1          # animFlags value for a scroll
 SCROLL_SPEED_VALUE = 1.0      # scrollDir carries the per-axis speed (cycles per second), so scrollSpeed stays 1
 TIMESTEP_RAW_PER_SECOND = 6552.0   # ESTIMATE: raw timestep 1638 was seen at about 0.25 s per step in game
 ANIMATIONS_JSON_NAME = 'material_animations.json'
@@ -153,11 +153,16 @@ def parse_filename(filename):
     the file is taken as the diffuse."""
     match = FILENAME_RE.match(filename)
     if match:
-        return match.group('basename'), ROLE_NAMES[match.group('suffix').upper()], False
+        return normalize_base_name(match.group('basename')), ROLE_NAMES[match.group('suffix').upper()], False
     bare = BARE_FILENAME_RE.match(filename)
     if bare:
-        return bare.group('basename'), 'diffuse', True
+        return normalize_base_name(bare.group('basename')), 'diffuse', True
     return None
+
+
+def normalize_base_name(name):
+    """Trailing underscores are ignored so NAME_01_.dds, NAME_01_O.dds and NAME_01__O.dds share one base name."""
+    return name.rstrip('_') or name
 
 
 def derive_base_name(base_color_map_path):
@@ -381,6 +386,12 @@ def populate_materials(materials_data, texture_index, texture_root, base_prefix,
                     emissive_zeroed_total += zeroed_changes
                     stage_changed += zeroed_changes
                     log(f"{material_name} [stage {stage_index}] zeroed emission (emissiveFactor=[0,0,0], emissiveIntensityNits=0).")
+
+            # A stage with a metallic map needs metallicFactor 1, otherwise the map has no effect
+            if stage.get('metallicMap') and stage.get('metallicFactor') != 1:
+                stage['metallicFactor'] = 1
+                stage_changed += 1
+                log(f"{material_name} [stage {stage_index}] metallicFactor: set to 1 (metallic map present).")
 
             # Opacity variants
             final_opacity = stage.get('opacityMap')

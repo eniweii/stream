@@ -44,6 +44,11 @@ axes (S moves the image vertically, T horizontally). "Swap S/T" is on by
 default. Use "Invert scroll" if the direction is still wrong.
 Snap scroll: the preview extends one texture toward the scroll direction. A
 dashed frame marks the normal one-texture view.
+Zero-speed override (preview only, nothing is exported): a smooth or snap scroll
+with speed 0 and 0 can be previewed with a speed of 1 cycle/s in one direction
+(S +1, S -1, T +1, T -1). For snap the speed is 0.5 (half a UV per step), because a
+whole-number speed times a whole number of steps never leaves a fraction. It is a
+test for the zero-speed investigation, not a decoded value.
 
 Usage: python carbon_material_viewer.py [dictionary.json] [--textures DIR]
 """
@@ -365,6 +370,16 @@ def scroll_value(t, speed, kind, step):
     return x - int(x)
 
 
+# Zero-speed override of the preview: name -> (axis, speed in cycles/s). Axis 0 = S, 1 = T.
+ZERO_OVERRIDES = {
+    "off": None,
+    "S +1": (0, 1.0),
+    "S -1": (0, -1.0),
+    "T +1": (1, 1.0),
+    "T -1": (1, -1.0),
+}
+
+
 def checker(size, cell=8):
     img = Image.new("RGBA", size, (70, 70, 70, 255))
     light = Image.new("RGBA", (cell, cell), (100, 100, 100, 255))
@@ -490,6 +505,15 @@ class PreviewPanel(ttk.Frame):
         for text, var in (("Swap S/T", self.swap_var), ("Invert scroll", self.invert_var)):
             ttk.Checkbutton(opts2, text=text, variable=var, command=self.render).pack(side=tk.LEFT, padx=2)
 
+        opts3 = ttk.Frame(self)
+        opts3.pack(fill=tk.X)
+        ttk.Label(opts3, text="Zero-speed override").pack(side=tk.LEFT, padx=2)
+        self.override_var = tk.StringVar(value="off")
+        override_box = ttk.Combobox(opts3, textvariable=self.override_var, width=6, state="readonly",
+                                    values=list(ZERO_OVERRIDES))
+        override_box.pack(side=tk.LEFT, padx=2)
+        override_box.bind("<<ComboboxSelected>>", lambda e: self.render())
+
         self.info_var = tk.StringVar()
         ttk.Label(self, textvariable=self.info_var, justify=tk.LEFT, wraplength=self.SIZE).pack(
             anchor=tk.W, pady=(4, 0))
@@ -596,13 +620,22 @@ class PreviewPanel(ttk.Frame):
                 sign = -1.0 if self.invert_var.get() else 1.0
                 step = (sc.get("rawTimeStep") or 0) / 256.0
                 speeds = ((sc.get("rawSpeedS") or 0) / 4096.0, (sc.get("rawSpeedT") or 0) / 4096.0)
+                override = ZERO_OVERRIDES.get(self.override_var.get())
+                overridden = bool(override) and not sc.get("rawSpeedS") and not sc.get("rawSpeedT")
+                if overridden:  # preview test only: 1 cycle/s (snap: half a UV per step) on one raw axis
+                    value = override[1] * (0.5 if sc["type"] == "Snap" else 1.0)
+                    speeds = (value, 0.0) if override[0] == 0 else (0.0, value)
                 vals = tuple(scroll_value(self.t, v, sc["type"], step) for v in speeds)
                 if swap:  # S drives the vertical axis, T the horizontal axis
                     vals, speeds = vals[::-1], speeds[::-1]
                 off = [sign * vals[0], sign * vals[1]]
                 lines.append(f"{scroll_text(rec)}  offset=({off[0]:+.3f}, {off[1]:+.3f})"
                              + ("  (S/T swapped)" if swap else ""))
-                if sc.get("timestepDriven"):
+                if overridden:
+                    lines.append(f"Override {self.override_var.get()}: speed forced to "
+                                 + ("half a UV per step" if sc["type"] == "Snap" else "1 cycle/s")
+                                 + " on one axis (preview test, not game data).")
+                elif sc.get("timestepDriven"):
                     lines.append("Timestep-driven (speed 0/0): moves in game, not shown here (decode pending).")
                 if sc["type"] == "Snap":
                     # Extend the view one texture toward the direction the image moves.

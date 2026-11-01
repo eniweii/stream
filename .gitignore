@@ -5,3 +5,4 @@ __pycache__/
 # Tool outputs: put all generated files in outputs/
 outputs/*
 !outputs/.gitkeep
+specconvert/texconv.exe
