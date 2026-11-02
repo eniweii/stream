@@ -49,6 +49,8 @@ from tkinter import filedialog, messagebox, ttk
 from nfs_region_parser import load_region_file, GAME_PARSERS, get_label_functions
 from export_sections import build_sections, build_elevation_polys, write_sections_json
 from export_zones import build_zones, count_by_type, write_zones_json
+from export_road_network import build_road_network, write_road_network_json, summary_lines as road_network_summary
+import road_lanes
 from nfs_region_common import section_letter as _default_section_letter
 from nfs_region_common import format_section_label as _default_format_section_label
 from nfs_region_common import section_subsection
@@ -76,10 +78,11 @@ class RegionViewerApp(tk.Tk):
         self.dim_nondrivable = tk.BooleanVar(value=False)
         self.game = tk.StringVar(value=game if game in GAME_PARSERS else 'None')
         self.active_mode = tk.StringVar(value='sections')   # which layer owns the options row and the clicks
-        self.layer_order = ['sections', 'troughs', 'collision', 'zones', 'nodes']   # bottom to top: the last one is drawn on top
+        self.layer_order = ['sections', 'troughs', 'collision', 'zones', 'lanes', 'nodes']   # bottom to top: the last one is drawn on top
         self.info_open = {}   # section info category -> open (True) or collapsed (False), kept between clicks
         self.layer_vars = {                                  # which layers are drawn
             'nodes': tk.BooleanVar(value=False),
+            'lanes': tk.BooleanVar(value=False),
             'sections': tk.BooleanVar(value=True),
             'zones': tk.BooleanVar(value=True),
             'troughs': tk.BooleanVar(value=True),
@@ -87,6 +90,11 @@ class RegionViewerApp(tk.Tk):
         }
         self.road_rotation = tk.StringVar(value='270')
         self.show_road_width = tk.BooleanVar(value=True)
+        self.show_lane_centres = tk.BooleanVar(value=True)
+        self.show_lane_arrows = tk.BooleanVar(value=True)
+        self._legend_win = None       # the Settings > Lane legend window, if open
+        self.selected_segment = None   # road segment index picked in the lane view
+        self._lane_cache = None        # cache: per segment lane polygons, rebuilt on a new file or rotation
         self.search_var = tk.StringVar()
         self.highlighted_ids = set()
         self.section_letter = _default_section_letter
@@ -128,9 +136,9 @@ class RegionViewerApp(tk.Tk):
             self.load_file(path)
 
     # ---------- UI ----------
-    MODES = [('nodes', 'Nodes'), ('sections', 'Sections'), ('zones', 'Zones'), ('troughs', 'Troughs'),
+    MODES = [('nodes', 'Nodes'), ('lanes', 'Lanes'), ('sections', 'Sections'), ('zones', 'Zones'), ('troughs', 'Troughs'),
              ('collision', 'Collision')]
-    MODE_TITLES = {'nodes': 'Node info', 'sections': 'Section info',
+    MODE_TITLES = {'nodes': 'Node info', 'lanes': 'Lane info', 'sections': 'Section info',
                    'zones': 'Zone info', 'troughs': 'Trough info', 'collision': 'Collision info'}
 
     def _build_ui(self):
@@ -187,6 +195,7 @@ class RegionViewerApp(tk.Tk):
             rotation_menu.add_radiobutton(label=degrees, value=degrees, variable=self.road_rotation,
                                            command=self._on_rotation_change)
         settings_menu.add_cascade(label="Road network rotation", menu=rotation_menu)
+        settings_menu.add_command(label="Lane legend...", command=self.open_lane_legend)
         menubar.add_cascade(label="Settings", menu=settings_menu)
 
         self.config(menu=menubar)
@@ -223,6 +232,16 @@ class RegionViewerApp(tk.Tk):
                         command=self.redraw).pack(side=tk.LEFT, padx=8, pady=2)
         self.rotation_label = tk.Label(nodes_row, text="", fg="#555")
         self.rotation_label.pack(side=tk.LEFT, padx=8)
+
+        lanes_row = self.mode_options['lanes']
+        tk.Checkbutton(lanes_row, text="Centre lines", variable=self.show_lane_centres,
+                        command=self.redraw).pack(side=tk.LEFT, padx=8, pady=2)
+        tk.Checkbutton(lanes_row, text="Lane arrows", variable=self.show_lane_arrows,
+                        command=self.redraw).pack(side=tk.LEFT, padx=8, pady=2)
+        tk.Button(lanes_row, text="Profiles...", command=self.open_profiles_dialog).pack(side=tk.LEFT, padx=8)
+        tk.Label(lanes_row, fg="#555",
+                 text="Rotation and colour legend: Settings menu. Strips follow curved segments and are "
+                      "coloured by lane type.").pack(side=tk.LEFT, padx=8)
 
         sections_row = self.mode_options['sections']
         tk.Checkbutton(sections_row, text="Show relations", variable=self.show_relations,
@@ -301,11 +320,13 @@ class RegionViewerApp(tk.Tk):
         tk.Button(zones_box, text="Export zones.json...",
                    command=self.export_zones_json).pack(anchor="w", pady=(6, 0))
 
-        nodes_box = tk.LabelFrame(parent, text="Road nodes", padx=10, pady=8)
-        nodes_box.pack(side=tk.TOP, fill=tk.X, padx=10, pady=4)
-        tk.Label(nodes_box, anchor="w", justify=tk.LEFT,
-                 text="Not written yet. The L5RA traffic node export will be added here.").pack(anchor="w")
-        tk.Button(nodes_box, text="Export road nodes...", state="disabled").pack(anchor="w", pady=(6, 0))
+        roads_box = tk.LabelFrame(parent, text="road_network.json", padx=10, pady=8)
+        roads_box.pack(side=tk.TOP, fill=tk.X, padx=10, pady=4)
+        tk.Label(roads_box, anchor="w", justify=tk.LEFT,
+                 text="The road network as parsed: nodes, segments, roads and lane profiles, with no rotation or\n"
+                      "transform. The traffic node editor works from this file. Needs a region file.").pack(anchor="w")
+        tk.Button(roads_box, text="Export road_network.json...",
+                   command=self.export_road_network_json).pack(anchor="w", pady=(6, 0))
 
     # ---------- Modes and layers ----------
     def _on_mode_change(self):
@@ -322,6 +343,7 @@ class RegionViewerApp(tk.Tk):
         self._update_order_label()
         self.selected_id = None
         self.selected_node_index = None
+        self.selected_segment = None
         self.selected_zones = set()
         self.selected_barriers = set()
         self.selected_troughs = set()
@@ -336,6 +358,8 @@ class RegionViewerApp(tk.Tk):
         hints = {
             'nodes': ("No road network in this file." if self.world and not self.world.road_network
                       else "Click a road node to inspect it."),
+            'lanes': ("No road network in this file." if self.world and not self.world.road_network
+                      else "Click a road segment to see its lanes at both ends."),
             'zones': "Click a zone or barrier.",
             'troughs': "Click inside a trough outline.",
             'collision': ("Open the stream file with File > Open collision file." if not self.collision_pieces
@@ -369,7 +393,7 @@ class RegionViewerApp(tk.Tk):
         the viewport stay where they are."""
         self.rotation_label.config(text=f"Rotation {self.road_rotation.get()} (Settings > Road network rotation)")
         visible = [key for key, var in self.layer_vars.items() if var.get()]
-        if visible == ['nodes']:
+        if visible and set(visible) <= {'nodes', 'lanes'}:
             self.fit_to_view()   # the nodes moved and nothing else shows where
         else:
             self.redraw()
@@ -398,6 +422,9 @@ class RegionViewerApp(tk.Tk):
         self.selected_node_index = None
         self._road_chains = None
         self._road_cache = None
+        self._lane_cache = None
+        self.selected_segment = None
+        self._fill_lane_legend()
         self._boundary_boxes = {}
         self._outline_spacing = {}
         self._overlap_clusters = None
@@ -536,7 +563,7 @@ class RegionViewerApp(tk.Tk):
             bxs, bys = self._boundary_points()
             xs += bxs
             ys += bys
-        if 'nodes' in layers:
+        if 'nodes' in layers or 'lanes' in layers:
             rxs, rys = self._road_points()
             xs += rxs
             ys += rys
@@ -638,6 +665,7 @@ class RegionViewerApp(tk.Tk):
             'collision': self._redraw_collision,
             'zones': self._redraw_track_paths,
             'nodes': self._redraw_road_network,
+            'lanes': self._redraw_lanes,
         }
         timings = []
         for key in self.layer_order:   # bottom first, so the last layer ends up on top
@@ -1769,6 +1797,14 @@ class RegionViewerApp(tk.Tk):
                 self._show_node_info(node_idx)
             else:
                 self._show_hint('nodes')
+        elif mode == 'lanes':
+            self.selected_id = None
+            self.selected_node_index = None
+            self.selected_segment = self._segment_at_canvas(cx, cy)
+            if self.selected_segment is not None:
+                self._show_segment_info(self.selected_segment)
+            else:
+                self._show_hint('lanes')
         elif mode == 'zones':
             self.selected_id = None
             self.selected_node_index = None
@@ -1867,6 +1903,228 @@ class RegionViewerApp(tk.Tk):
         self.info_text.delete("1.0", tk.END)
         self.info_text.insert(tk.END, "\n".join(lines))
         self.info_text.config(state="disabled")
+
+    # ---------- Lane view ----------
+    def _lane_geometry(self, rn):
+        """Per file and per rotation, kept between redraws. For every segment: its centre line in
+        the rotated plane (sampled along the curve when the segment is Curved), a box, the half
+        width, one polygon per lane strip and one arrow per traffic lane. The right side of the
+        centre line is (ty, -tx) of its direction in that plane; lane offsets are positive to the
+        right (see road_lanes.py)."""
+        deg = self.road_rotation.get()
+        cache = self._lane_cache
+        if cache is not None and cache['rn'] is rn and cache['deg'] == deg:
+            return cache
+        entries = []
+        node_count = len(rn.nodes)
+        for si, seg in enumerate(rn.segments):
+            if not (0 <= int(seg.nodeStart) < node_count and 0 <= int(seg.nodeEnd) < node_count):
+                continue
+            pts = [self._rotate_xy(p[0], p[2]) for p in road_lanes.segment_curve(rn, seg, 10)]
+            n = len(pts)
+            total = sum(((pts[i + 1][0] - pts[i][0]) ** 2 + (pts[i + 1][1] - pts[i][1]) ** 2) ** 0.5
+                        for i in range(n - 1))
+            if total < 1e-6:
+                continue
+            tangents, last = [], (1.0, 0.0)
+            for i in range(n):
+                p0, p1 = pts[max(0, i - 1)], pts[min(n - 1, i + 1)]
+                dx, dy = p1[0] - p0[0], p1[1] - p0[1]
+                length = (dx * dx + dy * dy) ** 0.5
+                last = (dx / length, dy / length) if length > 1e-9 else last
+                tangents.append(last)
+            rights = [(ty, -tx) for tx, ty in tangents]
+            polys, arrows, half = [], [], 0.0
+            for strip in road_lanes.segment_strips(rn, seg):
+                oa, ob, wa, wb = strip['a_offset'], strip['b_offset'], strip['a_width'], strip['b_width']
+                left_edge, right_edge = [], []
+                for i, (p, r) in enumerate(zip(pts, rights)):
+                    t = i / (n - 1)
+                    off = oa + (ob - oa) * t
+                    w = max(0.05, wa + (wb - wa) * t) / 2.0
+                    half = max(half, abs(off) + w)
+                    left_edge.append((p[0] + r[0] * (off - w), p[1] + r[1] * (off - w)))
+                    right_edge.append((p[0] + r[0] * (off + w), p[1] + r[1] * (off + w)))
+                ring = left_edge + right_edge[::-1]
+                polys.append((strip['type'], tuple(c for point in ring for c in point)))
+                if strip['type'] == road_lanes.TRAFFIC_LANE_TYPE:
+                    if n == 2:
+                        mid, tan, right, off = ((pts[0][0] + pts[1][0]) / 2, (pts[0][1] + pts[1][1]) / 2), tangents[0], rights[0], (oa + ob) / 2
+                    else:
+                        m = n // 2
+                        mid, tan, right, off = pts[m], tangents[m], rights[m], oa + (ob - oa) * (m / (n - 1))
+                    sign = 1.0 if strip['direction'] == 'forward' else -1.0
+                    arrows.append((mid[0] + right[0] * off, mid[1] + right[1] * off, tan[0] * sign, tan[1] * sign))
+            xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+            box = (min(xs) - half, min(ys) - half, max(xs) + half, max(ys) + half)
+            entries.append((si, pts, box, half, polys, arrows, total))
+        cache = {'rn': rn, 'deg': deg, 'entries': entries}
+        self._lane_cache = cache
+        return cache
+
+    LANE_POLYGON_LIMIT = 12000   # past this many strips on screen, only centre lines are drawn
+
+    def _redraw_lanes(self):
+        rn = self.world.road_network
+        if not rn or not rn.segments:
+            self.canvas.create_text(20, 20, anchor="nw", fill="#888",
+                                     text="No road network (CarpWorldGrid) found in this file.")
+            return
+        entries = self._lane_geometry(rn)['entries']
+        vx0, vy0, vx1, vy1 = self._visible_world_bounds()
+        visible = [e for e in entries
+                   if not (e[2][2] < vx0 or e[2][0] > vx1 or e[2][3] < vy0 or e[2][1] > vy1)]
+        strips = sum(len(e[4]) for e in visible)
+        scale, off_x, off_y = self.scale, self.offset_x, self.offset_y
+        draw_strips = strips <= self.LANE_POLYGON_LIMIT and scale * 4.0 >= 1.0   # a 4 m lane is >= 1 px wide
+        arrows_on = draw_strips and self.show_lane_arrows.get()
+
+        def to_canvas(points):
+            flat = []
+            for x, y in points:
+                flat += [off_x + x * scale, off_y - y * scale]
+            return flat
+
+        for si, pts, _box, _half, polys, arrows, total in visible:
+            if draw_strips:
+                for lane_type, c in polys:
+                    flat = []
+                    for k in range(0, len(c), 2):
+                        flat += [off_x + c[k] * scale, off_y - c[k + 1] * scale]
+                    self.canvas.create_polygon(*flat, fill=road_lanes.lane_type_color(lane_type), outline="")
+            if si == self.selected_segment:
+                self.canvas.create_line(*to_canvas(pts), fill="#ffe000", width=3)
+            elif self.show_lane_centres.get() or not draw_strips:
+                self.canvas.create_line(*to_canvas(pts), fill="#1c3550" if draw_strips else "#40c0ff", width=1)
+            if arrows_on and total * scale >= 30:
+                for x, y, dx, dy in arrows:
+                    cx, cy = off_x + x * scale, off_y - y * scale
+                    ux, uy = dx, -dy
+                    self.canvas.create_line(cx - ux * 8, cy - uy * 8, cx + ux * 8, cy + uy * 8,
+                                             fill="#f4fbff", arrow=tk.LAST, arrowshape=(7, 8, 3))
+
+    def _segment_at_canvas(self, cx, cy):
+        """Nearest road segment (centre line) under a click, or None. The tolerance is 8 pixels or
+        the half width of the segment, whichever is larger."""
+        rn = self.world.road_network
+        if not rn or not rn.segments:
+            return None
+        wx, wy = self.canvas_to_world(cx, cy)
+        best, best_dist = None, None
+        for si, pts, box, half, _polys, _arrows, _total in self._lane_geometry(rn)['entries']:
+            tol = max(8.0, half * self.scale)
+            margin = tol / self.scale
+            if wx < box[0] - margin or wx > box[2] + margin or wy < box[1] - margin or wy > box[3] + margin:
+                continue
+            canvas_pts = [self.world_to_canvas(*p) for p in pts]
+            d = min(self._distance_to_segment_px(cx, cy, canvas_pts[i], canvas_pts[i + 1])
+                    for i in range(len(canvas_pts) - 1))
+            if d <= tol and (best_dist is None or d < best_dist):
+                best, best_dist = si, d
+        return best
+
+    def open_lane_legend(self):
+        """Settings > Lane legend: a small window with the colour of each lane type."""
+        if self._legend_win is not None and self._legend_win.winfo_exists():
+            self._legend_win.lift()
+            return
+        win = tk.Toplevel(self)
+        win.title("Lane legend")
+        win.geometry("340x520")
+        self._legend_win = win
+        self._legend_body = tk.Frame(win)
+        self._legend_body.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=8)
+        self._fill_lane_legend()
+
+    def _fill_lane_legend(self):
+        win = self._legend_win
+        if win is None or not win.winfo_exists():
+            return
+        for child in self._legend_body.winfo_children():
+            child.destroy()
+        rn = self.world.road_network if self.world else None
+        used = road_lanes.lane_types_used(rn) if rn and rn.profiles else {}
+        title = "Lane types in this file (profile zones)" if used else "Lane types (no road network loaded)"
+        tk.Label(self._legend_body, text=title, anchor="w", font=("TkDefaultFont", 10, "bold")).pack(fill=tk.X)
+        for lane_type in (sorted(used) if used else range(16)):
+            row = tk.Frame(self._legend_body)
+            row.pack(fill=tk.X, pady=1)
+            tk.Frame(row, width=26, height=14, bg=road_lanes.lane_type_color(lane_type)).pack(side=tk.LEFT)
+            label = f"type {lane_type}"
+            if lane_type == road_lanes.TRAFFIC_LANE_TYPE:
+                label += "  (traffic, confirmed)"
+            if used:
+                label += f"  -  {used[lane_type]} zones"
+            tk.Label(row, text=label, anchor="w").pack(side=tk.LEFT, padx=8)
+        tk.Label(self._legend_body, anchor="w", justify=tk.LEFT, wraplength=300, fg="#444",
+                 text="\nOnly type 1 is confirmed; the other numbers are not named on purpose.\n\n"
+                      "Arrows (traffic lanes only): lanes right of middleZone run from the start node to the end "
+                      "node, lanes on the left run from the end to the start, a OneWay segment runs all lanes "
+                      "start to end. This is the rule the corridor code uses; it has not been checked in the "
+                      "game.\n\nYellow line: selected segment. Dark blue line: segment centre.").pack(fill=tk.X)
+
+    def _show_segment_info(self, segment_index):
+        lines = road_lanes.describe_segment(self.world.road_network, segment_index)
+        self.info_text.config(state="normal")
+        self.info_text.delete("1.0", tk.END)
+        self.info_text.insert(tk.END, "\n".join(lines))
+        self.info_text.config(state="disabled")
+
+    def open_profiles_dialog(self):
+        rn = self.world.road_network if self.world else None
+        if not rn or not rn.profiles:
+            messagebox.showinfo("Profiles", "No road profiles in the loaded file.")
+            return
+        win = tk.Toplevel(self)
+        win.title("Lane profiles")
+        win.geometry("640x520")
+        row = tk.Frame(win)
+        row.pack(side=tk.TOP, fill=tk.X, padx=8, pady=6)
+        tk.Label(row, text="Profile #").pack(side=tk.LEFT)
+        entry = tk.Entry(row, width=8)
+        entry.pack(side=tk.LEFT, padx=4)
+        body = tk.Text(win, wrap="none", font=("Courier", 9))
+        body.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+
+        def show(lines):
+            body.config(state="normal")
+            body.delete("1.0", tk.END)
+            body.insert(tk.END, "\n".join(lines))
+            body.config(state="disabled")
+
+        def show_profile():
+            try:
+                index = int(entry.get())
+            except ValueError:
+                return
+            if 0 <= index < len(rn.profiles):
+                show(road_lanes.profile_lines(index, rn.profiles[index]))
+            else:
+                show([f"Profile {index} is out of range (0..{len(rn.profiles) - 1})."])
+
+        entry.bind("<Return>", lambda e: show_profile())
+        tk.Button(row, text="Show", command=show_profile).pack(side=tk.LEFT)
+        tk.Button(row, text="Census", command=lambda: show(road_lanes.profile_census_lines(rn))).pack(side=tk.LEFT, padx=8)
+        show(road_lanes.profile_census_lines(rn))
+
+    def export_road_network_json(self):
+        """Writes road_network.json: the road network as parsed (nodes, segments, roads, lane
+        profiles), with no rotation or transform. Needs only the region file."""
+        if self.world is None:
+            messagebox.showerror("Export road_network.json", "No region file loaded.")
+            return
+        rn = self.world.road_network
+        if not rn or not rn.nodes:
+            messagebox.showwarning("Export road_network.json", "No road network in this file - nothing to export.")
+            return
+        data = build_road_network(rn)
+        path = filedialog.asksaveasfilename(
+            title="Export road_network.json", defaultextension=".json",
+            initialfile="road_network.json", filetypes=[("JSON", "*.json")])
+        if not path:
+            return
+        write_road_network_json(data, path)
+        messagebox.showinfo("Export road_network.json", f"Wrote {path}\n" + "\n".join(road_network_summary(data)))
 
     def export_sections_json(self):
         """Writes sections.json for the runtime streamer: drivable-section

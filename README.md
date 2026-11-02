@@ -19,7 +19,9 @@ Topic folders (`common/`, `scenery/`, `flares/`, `region/`, ...) read game files
 middleman files (JSON, TSV, CSV) to `outputs/<tool-name>/`. `beamng/` holds tools that read
 those middleman files and write BeamNG formats. Tools in `beamng/` never read game files.
 
-this should be removed soon because the goal is to remove any gaps and catch all data.
+`stream` carries plain stream data only (TSV or JSON, depending on the stage). No engine
+schemas live here: anything that writes a BeamNG format belongs in `beamng_stream`, and the
+`beamng/` folder here is only waiting to move there (see `tools.md`, last section).
 New shared modules go in `common/`.
 
 # Credits

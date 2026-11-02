@@ -1,6 +1,6 @@
 # What the tools do not fully read
 
-Source: reading the code in this repo (2026-10-03). Items marked (doc) come from a
+Source: reading the code in this repo (2026-10-03). Not re-checked in the 2026-11-01 cleanup: "synthetic only" and "not run on a real file" lines may be out of date. Items marked (doc) come from a
 docstring or comment, not from running the tool. No tool here was run on a real file for
 this list. Byte ranges are offsets inside one record.
 
@@ -36,7 +36,7 @@ this list. Byte ranges are offsets inside one record.
 
 **carbon_material_viewer.py** shows `carbon_material_dictionary.json` from AssetDumper. It does not read the stream file.
 
-## flares/
+## flares/ (to be consolidated)
 
 **flare_scenery_scan.py** (Tier 1, item 5)
 - Reads one LOD only (`--lod`, default 2). Flares on solids in the other LODs are not found.
@@ -68,7 +68,7 @@ offset S/T, and scale S/T, and writes the raw values. The divisors that turn the
 scroll type, timestep, speeds, offset, scale. Fields it does not read (none are scroll data): alpha blend type, alpha usage type, alpha sort,
 bias level, flags, rendering order, mipmap bias. (The C# reader keeps these; see the audit.)
 
-## world_anim/ (parser closed, playback open)
+## world_anim/ (diagnostics, to be replaced by a counting tool)
 
 - (doc) `unknown_0x6e` is unconfirmed. The raw flags byte (+0x4A) bits 0x08, 0x10, 0x20 are printed but not confirmed.
 - (doc) Open for playback: oscillation formula, delay source, timescale byte.
@@ -92,11 +92,7 @@ bias level, flags, rendering order, mipmap bias. (The C# reader keeps these; see
 
 - **particles/build_beamng_particles.py** Skips layers with emission rate 0 and linked layers. Applies only the Z part of Accel (it counts the horizontal part as ignored).
 
-## triggers/
-
-**world_event_trigger_scan.py** Decoded as ambient audio triggers (set aside). The AABB tree (0x36002) leaves are sampled (`--leaf-samples`), not fully decoded.
-
-## region/ (out of scope for the stream roadmap)
+## region/
 
 - **nfs_trackpath.py** Zone `user_data` is a runtime pointer, kept raw. `data[4]` is kept raw. Barriers are fully read.
 - **nfs_carp_parser.py** (doc) Container offsets are confirmed on a ProStreet file. Field values are not checked.

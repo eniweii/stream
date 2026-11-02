@@ -342,6 +342,20 @@ def parse_road_segments(data, payload_start, length):
     return out
 
 
+# kRoadSegment* flag bits, bit 0 first (MW decomp, WRoadElem.h). Names only; the meaning of a
+# bit that is not used by any tool here is not checked against a real file.
+SEGMENT_FLAG_NAMES = ["Decision", "NoTraffic", "RaceRouteForward", "Intersection", "Entrance",
+                      "CopsXorTraffic", "OneWay", "Shortcut", "Curved", "EndInverted",
+                      "StartInverted", "ChopperStayLow", "CrossesBarrier",
+                      "CrossesDriveThroughBarrier", "LaneMap", "InRace"]
+
+
+def segment_flag_names(flags):
+    """Names of the bits set in a segment's flags value (the value is read as unsigned 16 bit)."""
+    flags = int(flags) & 0xffff
+    return [name for bit, name in enumerate(SEGMENT_FLAG_NAMES) if flags & (1 << bit)]
+
+
 class RoadNetwork:
     """Convenience bundle of the 5 RNgp sub-blocks, once located."""
     def __init__(self, header=None, nodes=None, profiles=None, roads=None, segments=None):
