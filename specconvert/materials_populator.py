@@ -47,6 +47,10 @@ SCROLL_ANIM_FLAG = 1          # animFlags value for a scroll
 SCROLL_SPEED_VALUE = 1.0      # scrollDir carries the per-axis speed (cycles per second), so scrollSpeed stays 1
 TIMESTEP_RAW_PER_SECOND = 6552.0   # ESTIMATE: raw timestep 1638 was seen at about 0.25 s per step in game
 ANIMATIONS_JSON_NAME = 'material_animations.json'
+TIMESTEP_STEP_UV = 0.5        # a timestep-driven scroll moves half a UV map per step
+# Timestep-driven scrolls (speed 0 and 0) have no decoded jump axis: they run along +U. A texture hash listed
+# here (like '0xAE651288') uses its own direction instead: 'U+', 'U-', 'V+' or 'V-' (before the invert setting).
+TIMESTEP_DIRECTION_OVERRIDES = {}
 
 ALL_MAP_FIELDS = list(ROLE_STAGE_FIELD.values())
 FIELD_TO_ROLE = {field: role for role, field in ROLE_STAGE_FIELD.items()}
@@ -56,7 +60,7 @@ def apply_emissive_defaults(stage):
     """
     Kicks in when a stage HAS an emissiveMap (both normal and add):
     - Ensures emissiveFactor is active [1, 1, 1].
-    - Ensures emissiveIntensityNits is set (default 300).
+    - Sets emissiveIntensityNits to 2500.
     - Ensures vertColorEmissive is True so emission is multiplied by vertex color.
     """
     changed = 0
@@ -65,8 +69,8 @@ def apply_emissive_defaults(stage):
         stage['emissiveFactor'] = [1, 1, 1]
         changed += 1
 
-    if stage.get('emissiveIntensityNits') in (None, 0, 0.0):
-        stage['emissiveIntensityNits'] = 300
+    if stage.get('emissiveIntensityNits') != 2500:
+        stage['emissiveIntensityNits'] = 2500
         changed += 1
 
     # Normal emissive maps also multiply by vertex color
@@ -114,6 +118,14 @@ ADD_ALPHA_VALUES = {
     'translucentRecvShadows': True,
     'translucentZWrite': True,
 }
+
+
+def stage_in_emissive_add(stage, entry):
+    """True when any texture of the stage, or any file matched for it, sits in an emissive/add folder.
+    The role suffix does not matter: a _D and an _I file in that folder both mean additive alpha."""
+    paths = [v for _k, v in stage_map_fields(stage)]
+    paths += [v for v in (entry or {}).values() if isinstance(v, str)]
+    return any(is_emissive_add_path(p) for p in paths)
 
 
 def is_emissive_add_path(path):
@@ -404,7 +416,7 @@ def populate_materials(materials_data, texture_index, texture_root, base_prefix,
                         stage_changed += 1
                         log(f"{material_name} [stage {stage_index}] alpha field(s) set for {variant} opacity variant.")
 
-            if has_add_indicator and apply_add_alpha(mat):
+            if (has_add_indicator or stage_in_emissive_add(stage, entry)) and apply_add_alpha(mat):
                 alpha_variant_total += 1
                 stage_changed += 1
                 log(f"{material_name} [stage {stage_index}] alpha field(s) set for addAlpha.")
@@ -488,11 +500,40 @@ def scroll_axes(sc, swap_st, invert):
     return sign * axes[0], sign * axes[1]
 
 
-def is_native_scroll(sc):
-    """Smooth scroll with a real speed: BeamNG can do it with animFlags + scrollDir."""
-    if not sc or sc.get('type') != 'Smooth' or sc.get('timestepDriven'):
-        return False
-    return bool(sc.get('rawSpeedS') or sc.get('rawSpeedT') or sc.get('speedS') or sc.get('speedT'))
+def timestep_step_seconds(sc):
+    """Estimated seconds per step of a scroll (None without a timestep). The decode is not confirmed."""
+    raw_step = abs(sc.get('rawTimeStep') or 0)
+    return raw_step / TIMESTEP_RAW_PER_SECOND if raw_step else None
+
+
+def native_scroll_axes(sc, swap_st, invert, texture_hash=None):
+    """(U, V) in cycles per second of a scroll BeamNG can run natively (animFlags + scrollDir), or None.
+    Smooth and snap scrolls with a real speed use that speed (a snap scroll becomes smooth for now).
+    Timestep-driven ones (speed 0 and 0) move half a UV per step, so speed = 0.5 / step seconds, along +U
+    unless TIMESTEP_DIRECTION_OVERRIDES says otherwise."""
+    if not sc or sc.get('type') not in ('Smooth', 'Snap'):
+        return None
+    if sc.get('timestepDriven'):
+        step = timestep_step_seconds(sc)
+        if not step:
+            return None
+        speed = TIMESTEP_STEP_UV / step
+        direction = TIMESTEP_DIRECTION_OVERRIDES.get(texture_hash, 'U+')
+        if direction not in ('U+', 'U-', 'V+', 'V-'):
+            direction = 'U+'
+        sign = -1.0 if direction[1] == '-' else 1.0
+        if invert:
+            sign = -sign
+        return (sign * speed, 0.0) if direction[0] == 'U' else (0.0, sign * speed)
+    if sc.get('rawSpeedS') or sc.get('rawSpeedT') or sc.get('speedS') or sc.get('speedT'):
+        return scroll_axes(sc, swap_st, invert)
+    return None
+
+
+def scroll_signature(sc):
+    if not sc:
+        return None
+    return tuple(sc.get(k) for k in ('type', 'rawSpeedS', 'rawSpeedT', 'speedS', 'speedT', 'rawTimeStep', 'timestepDriven'))
 
 
 def clear_scroll_fields(stage):
@@ -510,7 +551,8 @@ def clear_scroll_fields(stage):
 
 
 def lua_entry_for(texture_hash, rec, frame_of, swap_st, invert):
-    """The material_animations.json entry for a texture that BeamNG cannot animate natively."""
+    """The material_animations.json entry for a texture that BeamNG cannot animate natively: an image
+    sequence frame (or an offset/scale). Scrolls never come here, they are written on the stage."""
     entry = {'texture': texture_hash}
     sc = rec.get('scroll')
     fs = rec.get('frameSwap') or (
@@ -519,9 +561,7 @@ def lua_entry_for(texture_hash, rec, frame_of, swap_st, invert):
     if fs:
         entry.update({'type': 'frame_swap', 'animation': fs['animation'], 'frame': fs['frame']})
         return entry
-    if not sc or is_native_scroll(sc):
-        return None
-    if sc.get('type') == 'OffsetScale':
+    if sc and sc.get('type') == 'OffsetScale':
         off = (sc.get('offsetS', 0.0), sc.get('offsetT', 0.0))
         scale = (sc.get('scaleS', 0.0) or 1.0, sc.get('scaleT', 0.0) or 1.0)
         if swap_st:
@@ -529,26 +569,15 @@ def lua_entry_for(texture_hash, rec, frame_of, swap_st, invert):
         entry.update({'type': 'offset_scale', 'offsetU': off[0], 'offsetV': off[1],
                       'scaleU': scale[0], 'scaleV': scale[1]})
         return entry
-    raw_step = sc.get('rawTimeStep') or 0
-    entry['type'] = 'snap' if sc.get('type') == 'Snap' else 'smooth'
-    entry['rawTimeStep'] = raw_step
-    entry['stepSecondsEstimate'] = abs(raw_step) / TIMESTEP_RAW_PER_SECOND if raw_step else None
-    if sc.get('timestepDriven'):
-        # Speed 0 and 0: the game moves it by its timestep, half a UV per step. The jump axis
-        # and direction are not decoded yet.
-        entry['timestepDriven'] = True
-        entry['direction'] = None
-    else:
-        u, v = scroll_axes(sc, swap_st, invert)
-        entry['speedU'], entry['speedV'] = u, v
-    return entry
+    return None
 
 
 def populate_animations(materials_data, dictionary, diffuse_by_hash, texture_root, base_prefix,
-                        swap_st=True, invert=False, log=print):
-    """Writes animation data only. Smooth scrolls go on the stage (animFlags + scrollDir).
-    Everything else (snap, timestep-driven, offset/scale, frame swap) goes in the returned
-    lua data, so a lua middleman can drive it. Returns (changes, lua_data)."""
+                        swap_st=True, invert=False, log=print, texture_index=None):
+    """Writes animation data only. Every scroll BeamNG can run goes on the stage (animFlags + scrollDir):
+    smooth, snap (as smooth) and timestep-driven ones, also on image-sequence stages. Image sequences (and
+    offset/scale entries) go in the returned lua data, so the environment manager can drive them.
+    texture_index (from scan_texture_folder) finds the emissive file of each frame. Returns (changes, lua_data)."""
     textures = dictionary.get('textures') or {}
     animations = dictionary.get('animations') or {}
 
@@ -565,12 +594,21 @@ def populate_animations(materials_data, dictionary, diffuse_by_hash, texture_roo
             path = base_prefix + os.path.relpath(disk, texture_root).replace(os.sep, '/') if disk else None
             if not path:
                 log(f"  frame {frame_hash} of {anim.get('name') or akey} has no texture file in the folder")
-            frames.append({'hash': frame_hash, 'path': path})
+            emissive_path = None
+            if disk and texture_index:
+                base = derive_base_name(os.path.basename(disk))
+                emissive_disk = (texture_index.get(base.lower()) or {}).get('emissive') if base else None
+                if emissive_disk:
+                    emissive_path = base_prefix + os.path.relpath(emissive_disk, texture_root).replace(os.sep, '/')
+            frames.append({'hash': frame_hash, 'path': path, 'emissive': emissive_path})
+        signatures = {scroll_signature((textures.get(h) or {}).get('scroll')) for h in anim.get('frames') or []}
+        if len(signatures) > 1:
+            log(f"  {anim.get('name') or akey}: its frames have different scroll settings; each stage uses the scroll of its own frame")
         lua_animations[akey] = {'name': anim.get('name'), 'fps': anim.get('fps'),
                                 'timeBase': anim.get('timeBase'), 'frames': frames}
 
     lua_materials = {}
-    native_count = cleared_count = lua_count = 0
+    native_count = cleared_count = lua_count = timestep_count = 0
     touched = set()
 
     for material_name, mat in materials_data.items():
@@ -585,14 +623,17 @@ def populate_animations(materials_data, dictionary, diffuse_by_hash, texture_roo
             rec = dict(textures.get(texture_hash) or {})
             sc = rec.get('scroll')
 
-            if is_native_scroll(sc) and not rec.get('frameSwap'):
-                u, v = scroll_axes(sc, swap_st, invert)
+            axes = native_scroll_axes(sc, swap_st, invert, texture_hash)
+            if axes:
+                u, v = axes
                 flags = stage.get('animFlags') if isinstance(stage.get('animFlags'), int) else 0
                 wanted = {'animFlags': flags | SCROLL_ANIM_FLAG, 'scrollDir': [u, v],
                           'scrollSpeed': SCROLL_SPEED_VALUE}
                 if any(stage.get(k) != val for k, val in wanted.items()):
                     stage.update(wanted)
                     native_count += 1
+                    if sc.get('timestepDriven'):
+                        timestep_count += 1
                     touched.add(material_name)
             elif clear_scroll_fields(stage):
                 cleared_count += 1
@@ -601,16 +642,27 @@ def populate_animations(materials_data, dictionary, diffuse_by_hash, texture_roo
             entry = lua_entry_for(texture_hash, rec, frame_of, swap_st, invert)
             if entry:
                 entry['stage'] = stage_index
+                if entry.get('type') == 'frame_swap':
+                    entry['emissive'] = bool(stage.get('emissiveMap'))
                 lua_materials.setdefault(material_name, []).append(entry)
                 lua_count += 1
 
-    log(f"Smooth scroll set on {native_count} stage(s); stale scroll fields cleared on {cleared_count} stage(s)")
+    log(f"Scroll set on {native_count} stage(s) ({timestep_count} timestep-driven, +U unless overridden); "
+        f"stale scroll fields cleared on {cleared_count} stage(s)")
+    emissive_keys = sorted({e['animation'] for entries in lua_materials.values() for e in entries
+                            if e.get('type') == 'frame_swap' and e.get('emissive')})
+    for akey in emissive_keys:
+        missing = [i + 1 for i, fr in enumerate(lua_animations[akey]['frames']) if not fr.get('emissive')]
+        if missing:
+            log(f"  {lua_animations[akey]['name'] or akey}: no emissive file for frame(s) {missing}; "
+                f"those frames keep the emissive map of the stage")
     log(f"{lua_count} stage(s) in {len(lua_materials)} material(s) go to {ANIMATIONS_JSON_NAME}")
     lua_data = {
-        'version': 1,
-        'notes': ('speedU/speedV are cycles per second after the S/T swap and invert settings. '
-                  'stepSecondsEstimate is an estimate: the timestep decode is not confirmed. '
-                  'Timestep-driven entries (speed 0 and 0) have no direction decoded yet.'),
+        'version': 2,
+        'notes': ('Image sequences: frames lists the diffuse and, where one exists, the emissive texture of each frame; '
+                  'a material entry says which stage shows which frame and whether the stage has an emissive map. '
+                  'Scrolls are not here: they are written on the stages (snap and timestep-driven ones as smooth '
+                  'scrolls, the timestep decode is an estimate). offset_scale entries are not read by anything yet.'),
         'animations': lua_animations,
         'materials': lua_materials,
     }
@@ -805,9 +857,11 @@ class App:
                  f"{len(dictionary.get('animations') or {})} animation(s)")
 
         diffuse_by_hash = scan_diffuse_by_hash(texture_root, log=self.log)
+        texture_index = scan_texture_folder(texture_root, log=self.log)
         changes, lua_data = populate_animations(
             materials_data, dictionary, diffuse_by_hash, texture_root, base_prefix,
-            swap_st=self.swap_st_var.get(), invert=self.invert_scroll_var.get(), log=self.log)
+            swap_st=self.swap_st_var.get(), invert=self.invert_scroll_var.get(), log=self.log,
+            texture_index=texture_index)
 
         if changes:
             timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
