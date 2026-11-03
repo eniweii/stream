@@ -17,6 +17,8 @@ Path | Purpose
 `common/nfs_outputs.py` | Helper: `out_dir(tool)` returns `outputs/<tool>/`
 `common/chunk_registry.py` | Compare a file's chunk IDs with `chunk_registry.tsv` (unregistered, label mismatch, not found)
 `common/chunk_probe.py` | Inspect one chunk ID: sizes, stride guess, per-column table, hex records
+`common/chunk_probe_all.py` | Probe every chunk ID of a whole file in one run: nesting, examples, hex, records as words and floats, columns; writes report, index TSV (ledger seed) and columns TSV
+`common/nfs_chunk_walk.py` | Shared by the probe tools: chunk walk with parent and depth, data-start rule (0x11 pad or unpadded), stride analysis
 **scenery/** |
 `scenery/nfs_stream_scenery.py` | Reader: scenery instances (stream file), override groups 0x34108/9 (region file). Command line writes `scenery_groups.tsv`, `scenery_overrides.tsv`, `scenery_infos.tsv` and `scenery_instances.tsv` (same columns as AssetDumper's files, so no AssetDumper run is needed; the region file adds Groups columns). With `--instances`, it joins the Groups columns to AssetDumper's file instead
 `scenery/nfs_scenery_dae_scan.py` | Read per-section DAE nodes (identity and transform)

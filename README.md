@@ -8,6 +8,7 @@ Run each script from the repo root, for example:
 
     python common/chunk_registry.py STREAML5RA.BUN --kind stream
     python common/chunk_probe.py STREAML5RA.BUN 0x0003410D
+    python common/chunk_probe_all.py STREAML5RA.BUN
     python flares/flare_scenery_scan.py --help
 
 Most scanners accept `--help`. Each script has a docstring with the layout it reads.

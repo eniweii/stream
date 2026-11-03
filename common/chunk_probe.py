@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """chunk_probe.py - inspect one chunk ID in a real file, to find its record layout.
 
-For every chunk with the given ID it shows offset, payload size, the 16-byte alignment
-pad (the game pads with 0x11), and a hex preview. Across all chunks it shows a size
+For every chunk with the given ID it shows offset, payload size, the alignment pad (the
+game pads most leaf payloads with 0x11; some families are not padded, see nfs_chunk_walk.py),
+and a hex preview. chunk_probe_all.py does this for every ID of a file in one run. Across all chunks it shows a size
 histogram and stride candidates (common divisors of the aligned data sizes). For a stride
 (guessed or given with --stride) it writes a per-column table: each 4-byte column's
 distinct values, min/max as u32, and whether it looks like a float, a small int, a
@@ -35,13 +36,15 @@ import struct
 from collections import Counter
 from functools import reduce
 
+from nfs_chunk_walk import split_payload
 from nfs_outputs import out_path
 from nfs_region_common import walk_chunks
 
 TOOL_NAME = "chunk_probe"
 PAD_BYTE = 0x11
-COMMON_STRIDES = [0x08, 0x0C, 0x10, 0x14, 0x18, 0x1C, 0x20, 0x24, 0x28, 0x2C, 0x30, 0x40,
-                  0x44, 0x48, 0x50, 0x58, 0x5C, 0x60, 0x70, 0x80, 0x90, 0xA0]
+COMMON_STRIDES = [0x08, 0x0C, 0x10, 0x14, 0x18, 0x1C, 0x20, 0x24, 0x28, 0x2C, 0x30, 0x34, 0x38,
+                  0x3C, 0x40, 0x44, 0x48, 0x4C, 0x50, 0x54, 0x58, 0x5C, 0x60, 0x64, 0x68, 0x6C,
+                  0x70, 0x74, 0x78, 0x80, 0x88, 0x90, 0x98, 0xA0, 0xB0, 0x100]
 
 
 def align16(n):
@@ -65,14 +68,12 @@ def collect(mm, chunk_id, size_filter):
             continue
         if size_filter is not None and length != size_filter:
             continue
-        data_start = align16(payload_start)
-        pad = data_start - payload_start
-        pad_ok = pad == 0 or all(b == PAD_BYTE for b in mm[payload_start:data_start])
+        data_start, pad, pad_kind = split_payload(mm, payload_start, length)
         found.append({
             "offset": offset, "length": length, "container": is_container,
             "payload_start": payload_start, "data_start": data_start,
             "data_len": max(0, payload_start + length - data_start),
-            "pad": pad, "pad_ok": pad_ok,
+            "pad": pad, "pad_kind": pad_kind,
         })
     return found
 
@@ -168,8 +169,9 @@ def main():
         p("Payload size histogram (size: count):")
         for size, cnt in sorted(hist.items(), key=lambda kv: (-kv[1], kv[0]))[:25]:
             p("  %d (0x%X): %d" % (size, size, cnt))
-        bad_pad = sum(1 for c in chunks if not c["pad_ok"])
-        p("Alignment pad not all 0x%02X in %d chunk(s)" % (PAD_BYTE, bad_pad))
+        kinds = Counter(c["pad_kind"] for c in chunks)
+        p("Padding kinds (pad11 = 0x%02X pad skipped, aligned, unpadded = starts with data): %s" % (
+            PAD_BYTE, ", ".join("%s %d" % kv for kv in sorted(kinds.items()))))
         p("")
 
         cands, g = stride_candidates(chunks)
@@ -186,9 +188,9 @@ def main():
         p("")
 
         for i, c in enumerate(chunks[:args.max_chunks]):
-            p("--- chunk %d at 0x%X: payload %d bytes, data starts 0x%X (pad %d%s), aligned data %d bytes" % (
+            p("--- chunk %d at 0x%X: payload %d bytes, data starts 0x%X (pad %d, %s), data %d bytes" % (
                 i, c["offset"], c["length"], c["data_start"], c["pad"],
-                "" if c["pad_ok"] else " NOT 0x11", c["data_len"]))
+                c["pad_kind"], c["data_len"]))
             p(hexdump(mm[c["data_start"]:c["data_start"] + args.hex_bytes], c["data_start"]))
             if stride and c["data_len"] >= stride:
                 n = min(args.records, c["data_len"] // stride)
