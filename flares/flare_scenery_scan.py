@@ -200,7 +200,7 @@ def resolve_names(path, keys):
     return found
 
 
-def main():
+def build_parser():
     ap = argparse.ArgumentParser(description="Expand scenery flares to world positions.")
     ap.add_argument("file", help="STREAML5RA.BUN")
     ap.add_argument("--lod", type=int, default=2, help="solid_keys index to use (2 = LOD c, as the game does)")
@@ -212,8 +212,11 @@ def main():
     ap.add_argument("--max-print", type=int, default=20, help="Flares to print")
     ap.add_argument("--near", nargs=3, type=float, metavar=("X", "Y", "Z"), help="Print flares near this world position")
     ap.add_argument("--radius", type=float, default=30.0, help="Radius for --near (default 30)")
-    args = ap.parse_args()
+    return ap
 
+
+def run(args):
+    """Scan the stream file; args needs file, lod, sections, json, tsv, hashes, include_2600, max_print, near, radius."""
     with open(args.file, "rb") as f:
         mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
 
@@ -451,6 +454,10 @@ def main():
                        f["in_override"], f["override_groups"], f["override_names"], f["override_flags"]]
                 fh.write("\t".join(str(c) for c in row) + "\n")
         print(f"Wrote {len(flares)} flares to {args.tsv}")
+
+
+def main():
+    run(build_parser().parse_args())
 
 
 if __name__ == "__main__":

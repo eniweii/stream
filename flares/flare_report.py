@@ -113,6 +113,22 @@ def load_yml(path):
     return entries
 
 
+def name_vault(vault, path):
+    """Replace hashed collection names (0x...) with names from a hash list (VLT hash family)."""
+    hashed = {h for h, e in vault.items() if e["name"].lower().startswith("0x")}
+    done = 0
+    for line in open(path, encoding="latin-1", errors="replace"):
+        t = line.strip()
+        if not t or t.startswith("#") or not hashed:
+            continue
+        h = vlt(t)
+        if h in hashed:
+            vault[h]["name"] = t
+            hashed.discard(h)
+            done += 1
+    print(f"Hashed vault collections named from the hash list: {done} ({len(hashed)} left hashed)")
+
+
 def describe(entry, idx):
     c = entry["colour"]
     r, g, b, a = (c.get(k, 0.0) for k in "XYZW")
@@ -124,16 +140,22 @@ def describe(entry, idx):
             f"scale {entry['MinScale']:g}..{entry['Maxscale']:g}  power {entry['Power']:g}  zbias {entry['ZBias']:g}")
 
 
-def main():
+def build_parser():
     ap = argparse.ArgumentParser(description="Join flare TSV with the vault yml.")
     ap.add_argument("tsv", help="TSV from flare_scenery_scan.py --tsv")
     ap.add_argument("yml", help="light_flares_cg.yml")
     ap.add_argument("--enriched", help="Write the joined rows to this TSV")
+    ap.add_argument("--hashes", help="Hash name list (e.g. common/hashes_main.txt) to name hashed vault collections")
     ap.add_argument("--lamppost-outer", action="store_true",
                     help="Use params[13] (lamppost_outer) as lamppost layer 1 (not in the exe table; unverified)")
-    args = ap.parse_args()
+    return ap
 
+
+def run(args):
+    """Join args.tsv with args.yml; args needs tsv, yml, enriched, lamppost_outer, hashes."""
     vault = load_yml(args.yml)
+    if getattr(args, "hashes", None):
+        name_vault(vault, args.hashes)
     missing = [i for i, h in enumerate(KEYS) if h not in vault]
     print(f"Vault entries read: {len(vault)}. Key slots without a yml entry: {missing or 'none'}")
 
@@ -206,6 +228,10 @@ def main():
                          "uni" if t in UNI_DIRECTIONAL else "n"]
                 fh.write("\t".join([r[c] for c in cols] + vals) + "\n")
         print(f"\nWrote {len(rows)} joined rows to {args.enriched}")
+
+
+def main():
+    run(build_parser().parse_args())
 
 
 if __name__ == "__main__":

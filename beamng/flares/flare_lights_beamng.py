@@ -490,7 +490,9 @@ def choose_tsv():
         raise RuntimeError("Pass the enriched TSV path as an argument when Tk is unavailable.") from exc
     root = tk.Tk()
     root.withdraw()
+    start = Path(__file__).resolve().parents[2] / "outputs" / "flares"
     path = filedialog.askopenfilename(
+        initialdir=str(start) if start.is_dir() else None,
         title="Select enriched Carbon flare TSV (flares_full.tsv)",
         filetypes=[("TSV files", "*.tsv"), ("Text files", "*.txt"), ("All files", "*.*")],
     )

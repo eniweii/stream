@@ -36,7 +36,7 @@ this list. Byte ranges are offsets inside one record.
 
 **carbon_material_viewer.py** shows `carbon_material_dictionary.json` from AssetDumper. It does not read the stream file.
 
-## flares/ (to be consolidated)
+## flares/ (`flare_export.py` runs scan and report in one pass)
 
 **flare_scenery_scan.py** (Tier 1, item 5)
 - Reads one LOD only (`--lod`, default 2). Flares on solids in the other LODs are not found.

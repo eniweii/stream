@@ -27,11 +27,12 @@ Path | Purpose
 **solids_materials/** |
 `solids_materials/nfs_solid_reader.py` | Reader: ObjectPack (0x80134000) solids, materials, geometry
 `solids_materials/carbon_material_viewer.py` | GUI viewer for `carbon_material_dictionary.json`
-**flares/** (to be consolidated into one tool) |
-`flares/flare_scan.py` | Flare packs (flare::pack, flare::instance)
+**flares/** |
+`flares/flare_export.py` | One pass: pick the stream file and the dump folder, scan, then enrich. Writes `outputs/flares/flares.tsv` and `flares_full.tsv`
+`flares/flare_scan.py` | Diagnostic (kept for the newer games): flare packs (flare::pack, flare::instance)
 `flares/flare_scenery_scan.py` | World positions of all scenery flares, with override group columns (`--hashes` names the groups)
 `flares/flare_report.py` | Join flare TSV with vault `light_flares_cg.yml`. `--enriched` adds the `L0_*` / `L1_*` color columns
-`flares/find_flare_hashes.py` | Find flare type table in the Carbon exe
+`flares/find_flare_hashes.py` | Diagnostic (kept for the newer games): find flare type table in the Carbon exe
 **texture_anim/** |
 `texture_anim/texture_anim_scan.py` | Scan TextureAnimPack chunks (frame-swap)
 `texture_anim/uv_scroll_dump.py` | Dump UV scroll values per texture
@@ -94,6 +95,5 @@ The editor will read `road_network.json` (`region/export_road_network.py`, the v
 
 ## Flare pipeline (stream file to BeamNG lights)
 
-    python flares/flare_scenery_scan.py STREAML5RA.BUN --hashes common/hashes_main.txt --tsv outputs/flares/flares.tsv
-    python flares/flare_report.py outputs/flares/flares.tsv light_flares_cg.yml --enriched outputs/flares/flares_full.tsv
-    python beamng/flares/flare_lights_beamng.py        (file picker: choose flares_full.tsv; writes items.level.json next to it)
+    python flares/flare_export.py        (pickers: STREAML5RA.BUN, then the dump folder with light_flares_cg.yml; hashes from common/hashes_main.txt)
+    python beamng/flares/flare_lights_beamng.py        (file picker opens in outputs/flares: choose flares_full.tsv; writes items.level.json next to it)
