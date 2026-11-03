@@ -12,13 +12,16 @@ Rules used (same as the ones settled for the road network, see tool_gaps.md / th
     direction group, nth traffic lane from the middle outward, extra traffic lanes clamp onto
     the last lane of the other end (lanes merge).
 """
-from nfs_carp_parser import segment_flag_names
+from nfs_carp_parser import segment_flag_names, SEGMENT_FLAG_NAMES
 
 FLAG_START_INVERTED = 1 << 10
 FLAG_END_INVERTED = 1 << 9
 TRAFFIC_LANE_TYPE = 1
 TOL = 0.15   # metres allowed between neighbouring lane edges when testing "tiles as lane centres"
 
+FLAG_DECISION = 1 << 0
+FLAG_NO_TRAFFIC = 1 << 1
+FLAG_INTERSECTION = 1 << 3
 FLAG_ONE_WAY = 1 << 6
 FLAG_CURVED = 1 << 8
 
@@ -166,9 +169,44 @@ def segment_strips(network, segment):
             continue
         strips.append({"key": key, "type": za["type"], "side": za["side"],
                        "direction": lane_direction(za["side"], one_way),
+                       "a_index": ia, "b_index": ib,
+                       "a_raw": za["raw_index"], "b_raw": zb["raw_index"],
                        "a_offset": za["offset"], "a_width": za["width"],
                        "b_offset": zb["offset"], "b_width": zb["width"]})
     return strips
+
+
+def node_segment_map(network):
+    """{node index: [segment indices that start or end there]}."""
+    found = {}
+    for si, seg in enumerate(network.segments):
+        for node in {int(seg.nodeStart), int(seg.nodeEnd)}:
+            found.setdefault(node, []).append(si)
+    return found
+
+
+def lane_continuations(network, segment_index, key, node_map, skip_flags=0):
+    """Lanes of other segments that carry on from lane `key` of a segment: [(segment, key, node)].
+    Two lanes meet at a shared node when they use the same zone of that node's profile (raw zone
+    index, so mirrored segments still match). At a junction every segment using that zone is
+    listed. Segments with any flag in `skip_flags` are left out."""
+    seg = network.segments[segment_index]
+    own = next((s for s in segment_strips(network, seg) if s["key"] == key), None)
+    if own is None:
+        return []
+    out = []
+    for node, raw in ((int(seg.nodeStart), own["a_raw"]), (int(seg.nodeEnd), own["b_raw"])):
+        for other in node_map.get(node, []):
+            if other == segment_index:
+                continue
+            oseg = network.segments[other]
+            if int(oseg.flags) & skip_flags:
+                continue
+            for s in segment_strips(network, oseg):
+                at_node = s["a_raw"] if int(oseg.nodeStart) == node else s["b_raw"]
+                if at_node == raw:
+                    out.append((other, s["key"], node))
+    return out
 
 
 # ---------- text for the info panel ----------
@@ -298,3 +336,23 @@ def profile_census_lines(network, examples=8):
     for tag, n in sorted(tags.items(), key=lambda kv: -kv[1]):
         lines.append(f"    {n:5d}  {tag}")
     return lines + example_lines
+
+
+def describe_strip(network, segment_index, key):
+    """Info panel text for one lane (paired zone) of a segment."""
+    seg = network.segments[segment_index]
+    strip = next((s for s in segment_strips(network, seg) if s["key"] == key), None)
+    if strip is None:
+        return [f"Segment #{segment_index}: no lane {key}"]
+    flags = int(seg.flags) & 0xffff
+    names = segment_flag_names(flags)
+    ia, ib = int(network.nodes[int(seg.nodeStart)].profileIndex), int(network.nodes[int(seg.nodeEnd)].profileIndex)
+    return [f"Lane {segment_index}:{key}  (segment #{segment_index})",
+            f"type={strip['type']}  side={strip['side']}  runs "
+            + ("start->end" if strip["direction"] == "forward" else "end->start") + "  (direction rule unverified)",
+            f"segment flags: 0x{flags:04x}  [{', '.join(names) if names else '-'}]",
+            "",
+            f"start: node #{seg.nodeStart}, profile #{ia}, zone {strip['a_index']} (profile zone {strip['a_raw']})",
+            f"    width={strip['a_width']:.2f}  offset={strip['a_offset']:+.2f}",
+            f"end:   node #{seg.nodeEnd}, profile #{ib}, zone {strip['b_index']} (profile zone {strip['b_raw']})",
+            f"    width={strip['b_width']:.2f}  offset={strip['b_offset']:+.2f}"]
