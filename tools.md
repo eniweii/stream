@@ -16,6 +16,7 @@ Path | Purpose
 `common/nfs_chunk_inventory.py` | List every distinct chunk ID in a file (count, sizes, first offset)
 `common/nfs_outputs.py` | Helper: `out_dir(tool)` returns `outputs/<tool>/`
 `common/chunk_registry.py` | Compare a file's chunk IDs with `chunk_registry.tsv` (unregistered, label mismatch, not found)
+`common/registry/undercover.tsv` | Per-game chunk ledger for Undercover (STREAML8R_MW2.BUN, 53 IDs, same columns as `chunk_registry.tsv`); use with `chunk_registry.py --registry` or `chunk_probe_all.py --registry`
 `common/chunk_probe.py` | Inspect one chunk ID: sizes, stride guess, per-column table, hex records
 `common/chunk_probe_all.py` | Probe every chunk ID of a whole file in one run: nesting, examples, hex, records as words and floats, columns; writes report, index TSV (ledger seed) and columns TSV
 `common/nfs_chunk_walk.py` | Shared by the probe tools: chunk walk with parent and depth, data-start rule (0x11 pad or unpadded), stride analysis

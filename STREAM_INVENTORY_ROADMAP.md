@@ -133,7 +133,7 @@ in the stream file, ProStreet / Undercover:
 2. Decode the ProStreet and Undercover rtnode (probe with stride 0x88, compare with Carbon's
    layout; the 20 extra bytes include a fourth solid key and new float fields).
 3. Probe the ProStreet frame-swap chunks the same way as Undercover's.
-4. Label every unlabeled row in the per-game ledgers.
+4. Label every unlabeled row in the per-game ledgers. Undercover ledger created: `common/registry/undercover.tsv` (53 IDs of STREAML8R_MW2.BUN, names from ChunkDef and AssetDumper readers, statuses only where a UC reader exists; the Carbon file moves to `carbon.tsv` later).
 5. Material layers: dissect 0x134015, 0x134F01 and 0x134902 in Undercover for the layer
    classifier, and build the per-game material dictionaries that settle the UV and effect patterns.
 
