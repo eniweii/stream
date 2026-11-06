@@ -47,7 +47,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from nfs_region_parser import load_region_file, GAME_PARSERS, get_label_functions
-from export_sections import build_sections, build_elevation_polys, write_sections_json
+from export_sections import build_sections, build_elevation_polys, build_override_names, write_sections_json
 from export_zones import build_zones, count_by_type, write_zones_json
 from export_road_network import build_road_network, write_road_network_json, summary_lines as road_network_summary
 import road_lanes
@@ -2427,12 +2427,14 @@ class RegionViewerApp(tk.Tk):
         if not path:
             return
         polys = build_elevation_polys(self.world)
-        write_sections_json(sections, path, polys)
+        override_names = build_override_names(self.stream_scenery)
+        write_sections_json(sections, path, polys, override_names)
         with_depth = sum(1 for s in sections if 'depth' in s)
         messagebox.showinfo(
             "Export sections.json",
             f"Wrote {len(sections)} drivable sections to {path}\n"
-            f"{with_depth} have depth sections, {len(polys)} elevation triangles written.\n"
+            f"{with_depth} have depth sections, {len(polys)} elevation triangles, "
+            f"{len(override_names)} override names written.\n"
             f"{len(boundaryless_kept)} related sections have stream data but no boundary (kept).")
 
     def export_zones_json(self):

@@ -5,7 +5,8 @@ Same output as the "Export sections.json..." button in viewers/nfs_region_viewer
 (the button now calls build_sections() from this file).
 
 sections.json holds the drivable-section boundary polygons plus each drivable section's
-related-section list. Only drivable boundaries are point-in-polygon tested at runtime
+related-section list. Its "overrideNames" table maps an override group's hex key ("0x454C22D2") to its
+name from hashes_main, for the groups that can be named; the runtime folds hex and name into one override. Only drivable boundaries are point-in-polygon tested at runtime
 (NFSMW VisibleSectionManager::FindBoundary / FindClosestBoundary). Non-drivable sections
 are pulled in only through a drivable section's related list.
 A related ID is kept if it has a boundary OR stream data. Only IDs with neither are dropped.
@@ -102,10 +103,26 @@ def build_elevation_polys(world):
     } for t in world.elevation]
 
 
-def write_sections_json(sections, path, elevation_polys=None):
+def build_override_names(stream_scenery):
+    """Return {"0xKEY": name} for every override group whose key the hash dictionary can name.
+
+    The runtime keeps objects that carry the hex key and objects that carry the name as one override, so
+    nothing is hashed in game. Groups without a known name are left out (they stay hex in the list).
+    """
+    names = {}
+    for g in stream_scenery.groups:
+        name = g.name
+        if name:
+            names[f"0x{g.key & 0xFFFFFFFF:08X}"] = name
+    return dict(sorted(names.items()))
+
+
+def write_sections_json(sections, path, elevation_polys=None, override_names=None):
     data = {"sections": sections}
     if elevation_polys is not None:
         data["elevationPolys"] = elevation_polys
+    if override_names:
+        data["overrideNames"] = override_names
     with open(path, 'w') as f:
         json.dump(data, f, indent=2)
 
@@ -128,9 +145,10 @@ def main():
         raise SystemExit("No drivable sections found - nothing to export.")
     path = args.out or str(out_path(TOOL_NAME, "sections.json"))
     polys = build_elevation_polys(world)
-    write_sections_json(sections, path, polys)
+    override_names = build_override_names(stream)
+    write_sections_json(sections, path, polys, override_names)
     print(f"Wrote {len(sections)} drivable sections ({sum(1 for s in sections if 'depth' in s)} with depth "
-          f"sections) and {len(polys)} elevation triangles to {path}")
+          f"sections), {len(polys)} elevation triangles and {len(override_names)} override names to {path}")
     print(f"{len(boundaryless_kept)} related sections have stream data but no boundary (kept).")
 
 

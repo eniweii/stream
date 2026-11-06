@@ -3,34 +3,35 @@
 # Populated from the chunk_probe_all output of STREAML8R_MW2.BUN and the readers in NFS-ModTools (test branch).
 # status: done | partial | scan-only | unread | set-aside | out-of-scope. Carbon statuses are NOT carried over: a row is partial/done only where a UC reader reads it.
 # tool: the reader that handles the chunk (AssetDumper class or stream python tool). Names come from AssetDumper, ChunkView/ChunkDef.txt or the probe.
+# Names and layouts marked UCGT come from github.com/NI240SX/UCGT (bChunkID.java, BlockType.java, streamEditor/streamBlocks); they are hints, the real hex decides.
 chunk_id	name	file	status	tool	roadmap	note
 0x00000000	Filler (id 0)	stream	out-of-scope		-	padding between chunks; 33246 chunks, 0-2044 bytes
-0x00034027	Smokeable spawner (ChunkDef: SPEED_SMOKEABLE_SPAWNER, 0x50 each)	stream	unread		-	transform-like records (position near +0x20); trailing fields likely radius-style as in Carbon; AssetDumper does not read it
-0x00034101	Scenery header	stream	partial	AssetDumper UndercoverScenery	-	only section number read
-0x00034102	SceneryInfo array (0x48 each)	stream	partial	AssetDumper UndercoverScenery	-	name and first solid key read
-0x00034103	SceneryInstance array (0x60 each)	stream	partial	AssetDumper UndercoverScenery	-	info index, rotation, position read
-0x00034104	Scenery section data (no ChunkDef name, 0xC0 each)	stream	unread		-	one per section, 0-1736 bytes
-0x00034105	Scenery tree nodes (0x30 each)	stream	unread		-	-
-0x00034106	Scenery overrides (ChunkDef name)	stream	unread		-	only 556 of 1459 sections have it
-0x00034107	Scenery preculler (0x200 each)	stream	unread		-	59 MB; keep raw bytes
-0x00034159	Unknown (not in ChunkDef)	stream	unread		-	753 chunks, 44-37748 bytes; 16-bit values after an 8-byte header (0B 00 00 00 0B 00 00 00)
-0x00034185	VisCurtains (ChunkDef: VISCURTAINS, 0x30 each)	stream	unread		-	two xyz triples per record (AABB-like, unconfirmed)
-0x00036001	EventTrigger header	stream	unread		-	Carbon: decoded as ambient audio triggers and set aside; UC layout not checked
-0x00036002	EventTrigger AABB tree	stream	unread		-	as 0x00036001
-0x00036003	EventTrigger records	stream	unread		-	as 0x00036001
-0x00037220	world_anim header	stream	partial	AssetDumper WorldAnimReader	-	layout taken from Carbon; UC not verified
-0x00037250	world_anim rtnode (0x88 bytes)	stream	partial	AssetDumper WorldAnimReader	-	UC rtnode layout still to decode
-0x00037260	world_anim counts	stream	partial	AssetDumper WorldAnimReader	-	layout taken from Carbon; UC not verified
-0x00037270	world_anim endptr	stream	partial	AssetDumper WorldAnimReader	-	layout taken from Carbon; UC not verified
-0x0003B801	Collision pack (WCollisionPack), one per section	stream	unread		-	645 chunks, 6424-307480 bytes; Carbon reader region/nfs_collision_pack.py not tried on UC
-0x0003B802	CARP world grid island (ChunkDef: CARP_WGRIDISLAND)	stream	unread		-	single 218 KB chunk; last item to look at
-0x0003BC00	EmitterLibrary / WorldFXTrigger (0x50 each)	stream	unread		-	23 chunks; same 0x50 stride as Carbon; emitters/fx_trigger_scan.py not tried on UC
+0x00034027	Smokeable spawner (ChunkDef: SPEED_SMOKEABLE_SPAWNER, 0x50 each)	stream	unread		-	UCGT ChunkSmokeSpawners: u32 11, u32 11, u16 ?, u16 count, u32 ?, then per record f0, vector xyz, pos xyz (not world axes, +Y up), 3 hashes, 2 ids, 1 int (UCGT may read more of the 0x50, not checked); AssetDumper does not read it
+0x00034101	Scenery header	stream	partial	AssetDumper UndercoverScenery; scenery/uc_stream_scenery.py	-	section number i32 at payload +0x0C, matches the world_anim node sections; nothing else read
+0x00034102	SceneryInfo array (0x48 each)	stream	partial	AssetDumper UndercoverScenery; scenery/uc_stream_scenery.py	-	0x48 per info, Carbon layout: name[24], 4 solid keys +0x18, radius f32 +0x38 (positive and finite on all 30616), flags u32 +0x3C, hierarchy hash +0x40 (not checked). Info flags are 0, 4 or 8 on 30596 rows; 20 rows hold ASCII junk (uninitialised memory, e.g. 0x5F6E7204), they are real infos used by one instance each: treat flags outside 0, 4, 8 as invalid. Meaning of 4 and 8 unknown
+0x00034103	SceneryInstance array (0x60 each)	stream	partial	AssetDumper UndercoverScenery; scenery/uc_stream_scenery.py	-	0x60 per instance, NOT the Carbon layout: bbox min +0x00, flags u32 +0x0C, bbox max +0x10, preculler s16 +0x1C, info number s16 +0x1E, position +0x20, guid +0x2C, matrix columns at +0x30/+0x40/+0x50, 4 bytes at +0x3C (UCGT: LodGroup, LoiFlags, SwayMax, WSpeed), PCA colour indexes s16 at +0x4C and +0x5C. Checked on all 139938 instances: info number in range 100%, bbox ordered 100%, position inside bbox 88.5% (the rest are mostly identity_matrix pieces), guid matches the world_anim nodes 78 of 78. Flag bit names are Carbon's and several do not fit UC: bit 5 is on road pieces (RD_/TD_), bits 18/19 follow the +0x3D byte, not platforms; sway/speed bytes look like noise
+0x00034104	Scenery IGA instance info (UCGT: SPEED_SCENERY_IGA_INSTANCE_INFO, ChunkScenery_Ads, 0xC0 each)	stream	unread		-	one per section, 0-1736 bytes; IGA / MassiveAds: internet-downloaded billboard texture replacements used by EA in the 2000s; UCGT has no reader
+0x00034105	Scenery tree nodes (UCGT: SPEED_SCENERY_TREE_NODES, 0x30 each)	stream	unread		-	UCGT: purpose not sure, no reader
+0x00034106	Scenery override hookups (UCGT: SPEED_SCENERY_OVERRIDE_HOOKUPS)	stream	unread		-	only 556 of 1459 sections have it; UCGT comment: pairs of shorts, OverrideInfoNumber and InstanceNumber, starting from 0
+0x00034107	Scenery preculler infos (UCGT: SPEED_SCENERY_PRECULLER_INFOS, 0x200 each)	stream	unread		-	59 MB; keep raw bytes; UCGT: inner 512 bytes are tPrecullerInfo VisibilityBits, often empty, sometimes long and sparse
+0x00034159	Heli sheet (UCGT: SPEED_HELI_SHEET, ChunkHeliSheet)	stream	unread		-	753 chunks, 44-37748 bytes; header u32 11, u32 11, u32 section id, u32 count, 8 zero bytes, then count x 9 s16 (one triangle: x0-2, y0-2, z0-2; UCGT divides x,y by 4.0 and z by 16.0), padded to an even short count; size = 24 + 18*count (+2 if count odd) holds on 5 chunks; axes and signedness not checked on real data; seen directly after a 0x34185 chunk with the same section id (sample #58)
+0x00034185	VisCurtains (UCGT: SPEED_VIS_CURTAINS, ChunkVisCurtains, 0x30 each)	stream	unread		-	layout agrees with UCGT: from xyz, u16 section id, u16 type (2 or 4), to xyz, 2 shorts (look like uninitialised padding), normal xyz (z 0), 0xAAAAAAAA; vertical wall from from.xy to to.xy between from.z and to.z; normal is perpendicular to the XY direction (checked on 3 records)
+0x00036001	EventTrigger header (UCGT: SPEED_EMTRIGGER_PACK_HEADER)	stream	unread		-	UCGT has names only, no reader; Carbon: decoded as ambient audio triggers and set aside; UC 0x36003 record (0x20: hash, 2 u16, u32, u32, xyz, f32 10.0) looks Carbon-like, not checked
+0x00036002	EventTrigger AABB tree (UCGT: SPEED_EMTRIGGER_PACK_TREE)	stream	unread		-	as 0x00036001
+0x00036003	EventTrigger records (UCGT: SPEED_EMTRIGGER_PACK_EVENT_TRIGGERS)	stream	unread		-	as 0x00036001
+0x00037220	world_anim header	stream	partial	world_anim/uc_world_anim_dump.py (AssetDumper WorldAnimReader assumes the Carbon layout)	-	header 4 x u32: (N, N, section, N), N = rtnodes that follow; 50 groups, all consistent. A group is the header, then N x (counts, rtnode, endptr). UC has no 0x37240 frames chunk and no shared 2400/2600 sections; every node has parent -1, timescale 0, flags 0
+0x00037250	world_anim rtnode (0x88 bytes; UCGT: SPEED_BBGANIM_INSTANCE_NODE)	stream	partial	world_anim/uc_world_anim_dump.py (AssetDumper WorldAnimReader assumes the Carbon layout)	-	136 data bytes (Carbon offsets minus 4 up to +0x58): matrix 4x4 (row 3 translation, w 1.0), +0x40 key, +0x44 parent i8/timescale/flags/pad (always -1,0,0,0), +0x48 four solid keys, +0x58 smackable (0), +0x5C scenery guid (matches 0x34103 guid in the node's own section, 78 of 78; translation equals instance position), +0x60 vec A f32 x3 + u32 0, +0x70 vec B f32 x3, +0x7C u16 type (2, 3 or 4), u16 section, +0x80 u32 0, +0x84 u32 1. Meaning of type, A and B still to check in the game: windmills A=(150-200,0,0), radars A=(0,0,15-60), banners A=(10,0,0) B=(0,10,0), DockLoader/F14Jet A=(0,0.5-1,0) B=(0,20-30,0); gorilla B.z holds the integer 1
+0x00037260	world_anim counts	stream	partial	world_anim/uc_world_anim_dump.py	-	u32, 1 on all 78 nodes
+0x00037270	world_anim endptr	stream	partial	world_anim/uc_world_anim_dump.py	-	u32 marker 0x69696969 on all 78 nodes
+0x0003B801	Collision pack (WCollisionPack), one per section	stream	unread		-	645 chunks, 6424-307480 bytes; UCGT reads it as ChunkCollisions (16-byte header: size, section number, flags, last address) + CARP.java + HavokCollisionMesh.java; UC packs are Havok: Carbon reader region/nfs_collision_pack.py gave 645 packs, 0 triangles, 3040 instances without article (2026-11-03)
+0x0003B802	CARP world grid island (ChunkDef: CARP_WGRIDISLAND)	stream	unread		-	single 218 KB chunk; last item to look at; UCGT CarpWGridIslandData.java reads it
+0x0003BC00	EmitterLibrary / WorldFXTrigger (UCGT: SPEED_EMITTER_LIBRARY, 0x50 each)	stream	unread		-	23 chunks; same 0x50 stride as Carbon, 3-row transform with identity z row at +0x20 in the probe; emitters/fx_trigger_scan.py not tried on UC; no UCGT reader
 0x00134002	SolidListInfo (0x90 bytes)	stream	partial	AssetDumper UndercoverSolidListReader	-	eSolid name and section tag read; section tag letter is the leading digit (D510 = 4510, E14 = 5014)
-0x00134003	ObjectPack offsets (8 bytes each)	stream	unread		-	AssetDumper only asserts size % 8
+0x00134003	ObjectPack index table (UCGT: SPEED_ESOLID_LIST_INDEX_TABLE, 8 bytes each)	stream	unread		-	not offsets: some values exceed the 1.44 GB file size (0xE5D3868E), so treat them as keys; AssetDumper only asserts size % 8
 0x00134011	Solid header	stream	partial	AssetDumper UndercoverSolidReader	-	-
 0x00134012	Solid texture list (12 bytes each)	stream	partial	AssetDumper UndercoverSolidReader	-	texture hash per entry; Carbon ledger says 8 bytes, UC is 12
 0x00134013	Solid light materials (8 bytes each)	stream	partial	AssetDumper UndercoverSolidReader	-	hash read, rest skipped (TODO in code)
-0x00134015	Solid texture types	stream	unread		-	AssetDumper skips it (TODO in code)
+0x00134015	Solid texture types (UCGT: SPEED_ESOLID_TEXTYPE_TABLE)	stream	unread		-	variable size; per solid a count, offsets and a slot name table (DIFFUSE, DIFFUSE2, ...) seen in the probe; AssetDumper skips it (TODO in code)
 0x00134900	Plat info (SolidObjectDescriptor, 0x48 each)	stream	partial	AssetDumper UndercoverSolidReader	-	only vertex count used
 0x00134901	Plat vertex buffer	stream	partial	AssetDumper UndercoverSolidReader	-	616 MB; raw buffer read, vertex decode by effect id
 0x00134902	Plat mesh entries (shading groups, 256 bytes each)	stream	partial	AssetDumper UndercoverSolidReader	-	read as UndercoverMaterial; see AssetDumper UndercoverLayerClassifier for layers
@@ -39,14 +40,14 @@ chunk_id	name	file	status	tool	roadmap	note
 0x00134F01	Plat material name hashes	stream	partial	AssetDumper UndercoverSolidReader	-	hashes read and dropped (TODO in code)
 0x33310001	TexturePack info (124 bytes)	stream	partial	AssetDumper Version4Tpk	-	version, name, pipeline path, hash read
 0x33310002	TexturePack hash list (8 bytes each)	stream	partial	AssetDumper Version4Tpk	-	count only; hashes come from the texture structs
-0x33310004	TextureStruct array	stream	partial	AssetDumper Version4Tpk	-	per-texture struct read by ReadTexture; stride not checked against Carbon 0x58
-0x33310005	Texture format list (24 bytes each)	stream	partial	AssetDumper Version4Tpk	-	D3D format read at +0x0C
+0x33310004	TextureStruct array (UCGT: TEXTURE_PACK_INFO_TABLE)	stream	partial	AssetDumper Version4Tpk	-	per-texture struct read by ReadTexture; UCGT NFSTexture.readHeaderPart1: fixed 0x58 bytes (matches Carbon stride) then name length byte and aligned name; fields: 3 zero ints, name hash, class hash, image offset, palette offset, image size, palette size, area, w/h u16, log2 x/y, compression, mip count, tileable flag, bias, rendering order, scrollType, used, alpha sort/usage/blend, flags, scroll timestep, scroll speed S/T, offset S/T, scale S/T (s16)
+0x33310005	Texture format list (24 bytes each; UCGT: TEXTURE_PACK_PLAT_INFO_TABLE)	stream	partial	AssetDumper Version4Tpk	-	D3D format read at +0x0C; UCGT: PC layout is 3 zero ints, format, 2 zero ints; Xbox layout differs
 0x33312001	TextureAnimPack header	stream	partial	AssetDumper TextureAnimationReader	-	UC size 0x2C matches Carbon layout
 0x33312002	TextureAnimPack frames (12 bytes each)	stream	partial	AssetDumper TextureAnimationReader	-	UC size matches Carbon layout
-0x33320001	Texture data header (24 bytes)	stream	unread		-	not referenced by Version4Tpk
+0x33320001	Texture data header (24 bytes; UCGT: TEXTURE_VRAM_DATA_HEADER)	stream	unread		-	not referenced by Version4Tpk; no UCGT reader; probe: u32 0, 0, 1, hash-like u32 at +0x0C, not checked
 0x33320002	Texture pixel data	stream	done	AssetDumper Version4Tpk	-	585 MB; 0x78 pad then per-texture offsets; DXT blocks
 0x80034100	ScenerySection (container)	stream	partial	AssetDumper UndercoverScenery	-	children 0x34104-0x34107 unread
-0x80036000	EventTriggerPack (container)	stream	unread		-	as 0x00036001
+0x80036000	EventTriggerPack (container; UCGT: SPEED_EMTRIGGER_PACK)	stream	unread		-	as 0x00036001
 0x80134000	ObjectPack (container)	stream	partial	AssetDumper UndercoverSolidListReader	-	children 0x134003 unread
 0x80134001	ObjectPack header (container)	stream	done	AssetDumper UndercoverSolidListReader	-	-
 0x80134008	ObjectPack container (empty payload)	stream	done	AssetDumper UndercoverSolidListReader	-	-
