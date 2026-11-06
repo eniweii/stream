@@ -71,6 +71,7 @@ Path | Purpose
 `beamng/particles/build_beamng_particles.py` | Step 3: `emitters_resolved.json` to BeamNG particle JSON
 `beamng/traffic_node_exporter.py` | Derived corridors to `items.level.json` DecalRoad lines (used by the traffic node editor)
 `beamng/flares/flare_lights_beamng.py` | Flare TSV to BeamNG PointLights (`items.level.json`), with `sectionID` and `sectionOverrideName`
+`beamng/lights/light_pack_beamng.py` | `lights.tsv` to BeamNG PointLights (`items.level.json`): name `{name}_{pack_section}_{index}`, fixed brightness, `sectionID` = pack section
 
 ## specconvert/ (standalone, not part of the stream pipeline)
 
@@ -88,7 +89,7 @@ Path | Purpose
 
 ## tests/ (synthetic, no game files needed)
 
-`tests/test_collision_dae_export.py`, `tests/test_collision_surfaces.py`, `tests/test_flare_lights_beamng.py`, `tests/test_traffic_corridors.py`, `tests/test_traffic_topology.py`, `tests/test_road_network_export.py`
+`tests/test_collision_dae_export.py`, `tests/test_collision_surfaces.py`, `tests/test_flare_lights_beamng.py`, `tests/test_light_pack_beamng.py`, `tests/test_traffic_corridors.py`, `tests/test_traffic_topology.py`, `tests/test_road_network_export.py`
 
 ## Pending move to beamng_stream
 

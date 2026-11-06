@@ -86,7 +86,7 @@ bias level, flags, rendering order, mipmap bias. (The C# reader keeps these; see
 
 - `light_pack_scan.py` keeps every field of the 0x60 light record. The AssetDumper reader dropped type, attenuation_type, shape, state, exclude_name_hash, direction and the per-light section number; they are in `lights.tsv` now. `falloff` is exported raw (the C# reader copied far_end into it).
 - Light AABB (0x135002) is still unread.
-- Tested on synthetic files only. The AssetDumper `--export-lights` option still exists; nothing in the stream repo turns `lights.tsv` into BeamNG lights yet (the flare pipeline does it for flares, `beamng/flares/flare_lights_beamng.py`).
+- Tested on synthetic files only. The AssetDumper `--export-lights` option still exists. `beamng/lights/light_pack_beamng.py` turns `lights.tsv` into BeamNG PointLights (these are spherical harmonics lights: no spotlights, brightness fixed, intensity/far/falloff not mapped).
 
 ## beamng/
 
