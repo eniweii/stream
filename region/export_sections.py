@@ -94,6 +94,33 @@ def build_sections(world, stream_scenery):
     return sections, boundaryless_kept
 
 
+def stream_file_problem(stream_scenery):
+    """Why the loaded stream file cannot be used for the export, or None. A stream file that yields no scenery
+    sections (wrong file, or one that failed to parse) would drop every related section that has no boundary."""
+    if stream_scenery is None:
+        return "No stream file is loaded."
+    sections = getattr(stream_scenery, "sections", None)
+    if not sections:
+        return "The stream file holds no scenery sections."
+    if not any(len(sec.instances) for sec in sections.values()):
+        return "The stream file holds scenery sections but no scenery instances."
+    return None
+
+
+def unreached_stream_sections(sections, stream_scenery):
+    """Sections with scenery that are in no section polygon and in no related list of the exported sections.
+    The runtime streams every one of them all the time, so more than a handful means the related lists lost
+    sections (the stream file loaded for the export did not match the level)."""
+    known = set()
+    for entry in sections:
+        known.add(entry["id"])
+        known.update(entry["related"])
+        for depth in entry.get("depth", []):
+            known.add(depth["id"])
+            known.update(depth["related"])
+    return sorted(i for i in stream_scenery.sections if i not in known)
+
+
 def build_elevation_polys(world):
     """Return every elevation triangle, in file order. The runtime checks all of them
     (the highest surface below the position wins), so none are filtered by section."""

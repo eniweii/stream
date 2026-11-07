@@ -47,7 +47,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from nfs_region_parser import load_region_file, GAME_PARSERS, get_label_functions
-from export_sections import build_sections, build_elevation_polys, build_override_names, write_sections_json
+from export_sections import build_sections, build_elevation_polys, build_override_names, write_sections_json, unreached_stream_sections, stream_file_problem
 from export_zones import build_zones, count_by_type, write_zones_json
 from export_road_network import build_road_network, write_road_network_json, summary_lines as road_network_summary
 import road_lanes
@@ -2415,6 +2415,14 @@ class RegionViewerApp(tk.Tk):
                 "real data before they're written out.")
             return
 
+        problem = stream_file_problem(self.stream_scenery)
+        if problem:
+            messagebox.showerror(
+                "Export sections.json",
+                problem + "\n\nThe file looks corrupt or is not the stream file of this region. Nothing was "
+                "exported: with no scenery data every related section without a boundary would be dropped.")
+            return
+
         sections, boundaryless_kept = build_sections(self.world, self.stream_scenery)
 
         if not sections:
@@ -2430,12 +2438,20 @@ class RegionViewerApp(tk.Tk):
         override_names = build_override_names(self.stream_scenery)
         write_sections_json(sections, path, polys, override_names)
         with_depth = sum(1 for s in sections if 'depth' in s)
-        messagebox.showinfo(
-            "Export sections.json",
+        unreached = unreached_stream_sections(sections, self.stream_scenery)
+        report = (
             f"Wrote {len(sections)} drivable sections to {path}\n"
             f"{with_depth} have depth sections, {len(polys)} elevation triangles, "
             f"{len(override_names)} override names written.\n"
-            f"{len(boundaryless_kept)} related sections have stream data but no boundary (kept).")
+            f"{len(boundaryless_kept)} related sections have stream data but no boundary (kept).\n"
+            f"{len(unreached)} sections with scenery are in no related list.")
+        if len(unreached) > 16:
+            messagebox.showwarning(
+                "Export sections.json",
+                report + "\n\nThat is far too many: the runtime would stream all of them, or none. "
+                "The stream file loaded here probably is not the one of this region file.")
+        else:
+            messagebox.showinfo("Export sections.json", report)
 
     def export_zones_json(self):
         """Writes zones.json for the runtime streamer: every TrackPathZone of
