@@ -19,6 +19,11 @@ import tkinter as tk
 from tkinter import filedialog, scrolledtext, messagebox
 from datetime import datetime
 
+try:                                  # native image sequence strips (same folder, also runs on its own)
+    import sequence_strips
+except ImportError:
+    sequence_strips = None
+
 FILENAME_RE = re.compile(r'^0x[0-9A-Fa-f]{8}_(?P<basename>.+)_(?P<suffix>REF|AO|[DNMROASIE])(?:\.[^.]+)?$', re.IGNORECASE)
 # A file with a hash prefix but no recognised role suffix is the diffuse (e.g. the _ANIM001 frames).
 BARE_FILENAME_RE = re.compile(r'^0x[0-9A-Fa-f]{8}_(?P<basename>.+?)(?:\.[^.]+)?$', re.IGNORECASE)
@@ -680,6 +685,9 @@ class App:
         self.dictionary_path_var = tk.StringVar()
         self.swap_st_var = tk.BooleanVar(value=True)
         self.invert_scroll_var = tk.BooleanVar(value=False)
+        self.strips_var = tk.BooleanVar(value=bool(sequence_strips and sequence_strips.TEXCONV_DEFAULT.exists()))
+        self.scale_var = tk.BooleanVar(value=True)
+        self.strip_exclude_var = tk.StringVar()
 
         row = 0
         tk.Label(root, text="materials.json:").grid(row=row, column=0, sticky="e", padx=4, pady=4)
@@ -705,6 +713,12 @@ class App:
         option_row.grid(row=row, column=1, sticky="w", padx=4)
         tk.Checkbutton(option_row, text="Swap S/T", variable=self.swap_st_var).pack(side="left")
         tk.Checkbutton(option_row, text="Invert scroll", variable=self.invert_scroll_var).pack(side="left", padx=8)
+        tk.Checkbutton(option_row, text="Native sequence strips (texconv)", variable=self.strips_var).pack(side="left", padx=8)
+        tk.Checkbutton(option_row, text="Scale bit (mesh UV covers the whole frame)", variable=self.scale_var).pack(side="left", padx=8)
+
+        row += 1
+        tk.Label(root, text="Keep on Lua frame swap (sequence names or keys):").grid(row=row, column=0, sticky="e", padx=4, pady=4)
+        tk.Entry(root, textvariable=self.strip_exclude_var, width=70).grid(row=row, column=1, padx=4, sticky="w")
 
         row += 1
         button_row = tk.Frame(root)
@@ -856,12 +870,41 @@ class App:
         self.log(f"Loaded dictionary: {len(dictionary.get('textures') or {})} texture(s), "
                  f"{len(dictionary.get('animations') or {})} animation(s)")
 
+        lua_path = os.path.join(os.path.dirname(materials_path), ANIMATIONS_JSON_NAME)
+        use_strips = self.strips_var.get() and sequence_strips is not None
+        if self.strips_var.get() and sequence_strips is None:
+            self.log("sequence_strips.py is not next to this script; strips skipped.")
+        if use_strips and not sequence_strips.TEXCONV_DEFAULT.exists():
+            messagebox.showerror("Materials Populator", f"texconv.exe not found at {sequence_strips.TEXCONV_DEFAULT}")
+            return
+
+        # stages an earlier run converted to a strip go back on their frame texture first, so this run starts clean
+        restored = 0
+        if sequence_strips is not None and os.path.isfile(lua_path):
+            with open(lua_path, "r", encoding="utf-8") as f:
+                old_lua_data = json.load(f)
+            restored = sequence_strips.revert_strips(materials_data, old_lua_data, log=self.log)
+            if restored:
+                self.log(f"{restored} stage(s) of an earlier run put back on their frame texture")
+
         diffuse_by_hash = scan_diffuse_by_hash(texture_root, log=self.log)
         texture_index = scan_texture_folder(texture_root, log=self.log)
         changes, lua_data = populate_animations(
             materials_data, dictionary, diffuse_by_hash, texture_root, base_prefix,
             swap_st=self.swap_st_var.get(), invert=self.invert_scroll_var.get(), log=self.log,
             texture_index=texture_index)
+        changes += restored
+
+        if use_strips:
+            if not base_prefix:
+                self.log("No path prefix known; native sequence strips skipped.")
+            else:
+                self.log("Native sequence strips:")
+                strips, strip_changes = sequence_strips.build_and_apply(
+                    materials_data, lua_data, texture_root, base_prefix, sequence_strips.TEXCONV_DEFAULT,
+                    exclude=self.strip_exclude_var.get().split(), use_scale=self.scale_var.get(), log=self.log)
+                changes += strip_changes
+                self.log(f"{len(strips)} sequence(s) converted to a strip, {strip_changes} stage(s) written")
 
         if changes:
             timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
@@ -874,7 +917,6 @@ class App:
         else:
             self.log("No stage changes for materials.json.")
 
-        lua_path = os.path.join(os.path.dirname(materials_path), ANIMATIONS_JSON_NAME)
         with open(lua_path, "w", encoding="utf-8") as f:
             json.dump(lua_data, f, indent=2)
         self.log(f"Wrote {lua_path}")
