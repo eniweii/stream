@@ -27,7 +27,8 @@ for _folder in ("common", "region", "scenery", "solids_materials", "beamng"):
 from nfs_carp_parser import find_carp_offset, load_road_network_from_carp  # noqa: E402
 from traffic_corridors import (  # noqa: E402
     DEFAULT_TYPE_RULES, build_corridors, merged_type_rules, override_key, sample_segment,
-    beamng_transform, harmonize_zone_endpoints, merge_connected_corridors,
+    beamng_transform, harmonize_zone_endpoints, merge_connected_corridors, combine_carriageways,
+    thin_roads, resolve_junctions, scale_road_widths,
 )
 from traffic_node_exporter import write_items_level, write_source_manifest  # noqa: E402
 try:  # Use the repository's shared output-path convention.
@@ -77,6 +78,20 @@ class TrafficNodeEditor(tk.Tk):
         # CARP decision segments carry actual curved turning movements. Include
         # eligible ones by default; users can disable them for comparison.
         self.include_decision_connectors_var = tk.BooleanVar(value=True)
+        # Opposing traffic lanes of a segment as one two-way DecalRoad (dead median inside the width).
+        self.combine_carriageways_var = tk.BooleanVar(value=False)
+        self.carriageway_report = {}
+        # Node thinning and junction-connector merging for the export (see _rebuild).
+        self.node_tolerance_var = tk.StringVar(value="0.3")
+        self.max_node_spacing_var = tk.StringVar(value="25")
+        self.merge_connectors_var = tk.BooleanVar(value=True)
+        self.thin_report = {}
+        self._built_settings = None
+        self.junction_roads_var = tk.BooleanVar(value=False)
+        self.connect_radius_var = tk.StringVar(value="50")      # max length of a junction / runoff connection (m)
+        self.node_width_scale_var = tk.StringVar(value="1")   # global factor on every exported node width
+        self.junction_report = {}
+        self.road_detail_var = tk.StringVar(value="1")   # DecalRoad "detail" (BeamNG default 0.1)
 
         self.layer_vars = {
             "source": tk.BooleanVar(value=True),
@@ -343,7 +358,29 @@ class TrafficNodeEditor(tk.Tk):
                         variable=self.include_decision_connectors_var,
                         command=self._on_decision_connector_change).grid(
                             row=5, column=0, columnspan=2, sticky="w", pady=3)
-        ttk.Label(input_box, text="Export uses the same per-zone curves shown in Zones mode. All sampled points along a continuous lane are stored as nodes of one DecalRoad (not one object per point); compatible pieces are joined by source node/profile-zone identity, including where CARP road IDs change at a simple continuation. Decision connectors remain separate curved DecalRoads with autoJunction enabled. Width comes from each zone node. NFS height is corrected by the configured +Z offset during serialization.", wraplength=900).grid(row=6, column=0, columnspan=2, sticky="w", pady=(5, 0))
+        ttk.Checkbutton(input_box, text="Combine lanes into one DecalRoad (two-way, uneven or one-sided; a median becomes a dead gap in the width)",
+                        variable=self.combine_carriageways_var,
+                        command=self._on_combine_carriageways_change).grid(
+                            row=6, column=0, columnspan=2, sticky="w", pady=3)
+        ttk.Label(input_box, text="Export uses the same per-zone curves shown in Zones mode. All sampled points along a continuous lane are stored as nodes of one DecalRoad (not one object per point); compatible pieces are joined by source node/profile-zone identity, including where CARP road IDs change at a simple continuation. Decision connectors remain separate curved DecalRoads with autoJunction enabled. Width comes from each zone node. NFS height is corrected by the configured +Z offset during serialization.", wraplength=900).grid(row=7, column=0, columnspan=2, sticky="w", pady=(5, 0))
+        ttk.Checkbutton(input_box, text="Merge junction connectors into the roads they connect (unique links only)",
+                        variable=self.merge_connectors_var,
+                        command=self._on_merge_connectors_change).grid(
+                            row=8, column=0, columnspan=2, sticky="w", pady=3)
+        ttk.Label(input_box, text="Node tolerance (m, 0 = keep every node):").grid(row=9, column=0, sticky="w", padx=(0, 8), pady=3)
+        ttk.Entry(input_box, textvariable=self.node_tolerance_var, width=24).grid(row=9, column=1, sticky="w", pady=3)
+        ttk.Label(input_box, text="Max node spacing (m, 0 = none):").grid(row=10, column=0, sticky="w", padx=(0, 8), pady=3)
+        ttk.Entry(input_box, textvariable=self.max_node_spacing_var, width=24).grid(row=10, column=1, sticky="w", pady=3)
+        ttk.Label(input_box, text="Road detail / subdivision (BeamNG default 0.1):").grid(row=11, column=0, sticky="w", padx=(0, 8), pady=3)
+        ttk.Entry(input_box, textvariable=self.road_detail_var, width=24).grid(row=11, column=1, sticky="w", pady=3)
+        ttk.Label(input_box, text="Connection radius, junctions and runoffs (m, 0 = unlimited):").grid(row=14, column=0, sticky="w", padx=(0, 8), pady=3)
+        ttk.Entry(input_box, textvariable=self.connect_radius_var, width=24).grid(row=14, column=1, sticky="w", pady=3)
+        ttk.Label(input_box, text="Node width scale, all roads (1 = as source, e.g. 0.95):").grid(row=13, column=0, sticky="w", padx=(0, 8), pady=3)
+        ttk.Entry(input_box, textvariable=self.node_width_scale_var, width=24).grid(row=13, column=1, sticky="w", pady=3)
+        ttk.Checkbutton(input_box, text="Junctions: roads cross / end on the through road, runoffs extended, no connectors (needs Combine)",
+                        variable=self.junction_roads_var,
+                        command=self._on_junction_roads_change).grid(
+                            row=12, column=0, columnspan=2, sticky="w", pady=3)
         action_row = ttk.Frame(outer)
         action_row.pack(fill=tk.X, pady=8)
         ttk.Button(action_row, text="Rebuild preview", command=self.rebuild_preview).pack(side=tk.LEFT, padx=(0, 5))
@@ -363,11 +400,19 @@ class TrafficNodeEditor(tk.Tk):
         if DEFAULT_OVERRIDES.exists():
             try:
                 data = json.loads(DEFAULT_OVERRIDES.read_text(encoding="utf-8"))
-                self.state_data.update({k: data[k] for k in ("vertical_offset", "type_rules", "overrides", "patterns", "include_decision_connectors", "over_objects") if k in data})
+                self.state_data.update({k: data[k] for k in ("vertical_offset", "type_rules", "overrides", "patterns", "include_decision_connectors", "over_objects", "combine_carriageways", "node_tolerance", "max_node_spacing", "merge_connectors", "road_detail", "junction_roads", "node_width_scale", "connect_radius") if k in data})
                 self.type_rules = merged_type_rules(self.state_data.get("type_rules"))
                 self.vertical_offset_var.set(str(self.state_data.get("vertical_offset", 150.0)))
                 self.include_decision_connectors_var.set(bool(self.state_data.get("include_decision_connectors", True)))
                 self.over_objects_var.set(bool(self.state_data.get("over_objects", True)))
+                self.combine_carriageways_var.set(bool(self.state_data.get("combine_carriageways", False)))
+                self.node_tolerance_var.set(str(self.state_data.get("node_tolerance", 0.3)))
+                self.max_node_spacing_var.set(str(self.state_data.get("max_node_spacing", 25.0)))
+                self.merge_connectors_var.set(bool(self.state_data.get("merge_connectors", True)))
+                self.road_detail_var.set(str(self.state_data.get("road_detail", 1.0)))
+                self.junction_roads_var.set(bool(self.state_data.get("junction_roads", False)))
+                self.node_width_scale_var.set(str(self.state_data.get("node_width_scale", 1.0)))
+                self.connect_radius_var.set(str(self.state_data.get("connect_radius", 50.0)))
                 self.override_path = DEFAULT_OVERRIDES
             except (OSError, ValueError, TypeError) as exc:
                 print(f"[traffic_node_editor] Could not load default overrides: {exc}")
@@ -425,7 +470,19 @@ class TrafficNodeEditor(tk.Tk):
         endpoint_report = harmonize_zone_endpoints(self.preview["corridors"])
         self.corridors = self.preview["corridors"]
         self.zone_endpoint_report = endpoint_report
-        self.export_roads = merge_connected_corridors(self.corridors)
+        export_input = self.corridors
+        self.carriageway_report = {}
+        if self.combine_carriageways_var.get():
+            export_input, self.carriageway_report = combine_carriageways(self.corridors)
+        self.junction_report = {}
+        if self.combine_carriageways_var.get() and self.junction_roads_var.get():
+            export_input, self.junction_report = resolve_junctions(export_input, connect_radius=self._connect_radius())
+        self.export_roads = merge_connected_corridors(export_input, merge_decision=self.merge_connectors_var.get())
+        tolerance, spacing = self._thin_settings()
+        self.export_roads, self.thin_report = thin_roads(self.export_roads, tolerance, spacing,
+                                                         max(tolerance, 0.5) if tolerance > 0 else None)
+        self.export_roads = scale_road_widths(self.export_roads, self._width_scale())
+        self._built_settings = (tolerance, spacing, self.merge_connectors_var.get(), self._width_scale(), self._connect_radius())
         self.merge_warnings = []  # ambiguous source-graph joins intentionally stay split
         self.corridor_by_key = {c["source_key"]: c for c in self.corridors}
         if hasattr(self, "filter_combo"):
@@ -966,6 +1023,14 @@ class TrafficNodeEditor(tk.Tk):
         self.state_data["source_file"] = str(self.world_path) if self.world_path else self.state_data.get("source_file")
         self.state_data["include_decision_connectors"] = self.include_decision_connectors_var.get()
         self.state_data["over_objects"] = self.over_objects_var.get()
+        self.state_data["combine_carriageways"] = self.combine_carriageways_var.get()
+        self.state_data["merge_connectors"] = self.merge_connectors_var.get()
+        self.state_data["road_detail"] = self._road_detail()
+        self.state_data["junction_roads"] = self.junction_roads_var.get()
+        self.state_data["node_width_scale"] = self._width_scale()
+        self.state_data["connect_radius"] = self._connect_radius()
+        tolerance, spacing = self._thin_settings()
+        self.state_data["node_tolerance"], self.state_data["max_node_spacing"] = tolerance, spacing
         try:
             self.state_data["vertical_offset"] = float(self.vertical_offset_var.get())
         except ValueError:
@@ -980,11 +1045,19 @@ class TrafficNodeEditor(tk.Tk):
         if path:
             try:
                 data = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
-                self.state_data.update({k: data[k] for k in ("vertical_offset", "type_rules", "overrides", "patterns", "include_decision_connectors", "over_objects") if k in data})
+                self.state_data.update({k: data[k] for k in ("vertical_offset", "type_rules", "overrides", "patterns", "include_decision_connectors", "over_objects", "combine_carriageways", "node_tolerance", "max_node_spacing", "merge_connectors", "road_detail", "junction_roads", "node_width_scale", "connect_radius") if k in data})
                 self.type_rules = merged_type_rules(self.state_data.get("type_rules"))
                 self.vertical_offset_var.set(str(self.state_data.get("vertical_offset", 150.0)))
                 self.include_decision_connectors_var.set(bool(self.state_data.get("include_decision_connectors", True)))
                 self.over_objects_var.set(bool(self.state_data.get("over_objects", True)))
+                self.combine_carriageways_var.set(bool(self.state_data.get("combine_carriageways", False)))
+                self.node_tolerance_var.set(str(self.state_data.get("node_tolerance", 0.3)))
+                self.max_node_spacing_var.set(str(self.state_data.get("max_node_spacing", 25.0)))
+                self.merge_connectors_var.set(bool(self.state_data.get("merge_connectors", True)))
+                self.road_detail_var.set(str(self.state_data.get("road_detail", 1.0)))
+                self.junction_roads_var.set(bool(self.state_data.get("junction_roads", False)))
+                self.node_width_scale_var.set(str(self.state_data.get("node_width_scale", 1.0)))
+                self.connect_radius_var.set(str(self.state_data.get("connect_radius", 50.0)))
                 self.override_path = pathlib.Path(path)
                 self._dirty = False
                 self.rebuild_preview()
@@ -1000,6 +1073,56 @@ class TrafficNodeEditor(tk.Tk):
 
     def _on_decision_connector_change(self):
         self.state_data["include_decision_connectors"] = self.include_decision_connectors_var.get()
+        self._dirty = True
+        self.rebuild_preview()
+
+    def _thin_settings(self):
+        """Node tolerance and max spacing in metres from the Exporter tab (0 turns it off)."""
+        def read(var, default):
+            try:
+                value = float(var.get())
+                return value if math.isfinite(value) and value >= 0 else default
+            except ValueError:
+                return default
+        return read(self.node_tolerance_var, 0.3), read(self.max_node_spacing_var, 25.0)
+
+    def _road_detail(self):
+        try:
+            value = float(self.road_detail_var.get())
+            return value if math.isfinite(value) and value > 0 else 1.0
+        except ValueError:
+            return 1.0
+
+    def _width_scale(self):
+        """Global node width factor from the Exporter tab (1.0 = as in the source)."""
+        try:
+            value = float(self.node_width_scale_var.get())
+            return value if math.isfinite(value) and value > 0 else 1.0
+        except ValueError:
+            return 1.0
+
+    def _connect_radius(self):
+        """Max length (m) of a junction or runoff connection; 0 = unlimited."""
+        try:
+            value = float(self.connect_radius_var.get())
+            return value if math.isfinite(value) and value >= 0 else 50.0
+        except ValueError:
+            return 50.0
+
+    def _on_junction_roads_change(self):
+        self.state_data["junction_roads"] = self.junction_roads_var.get()
+        self.state_data["node_width_scale"] = self._width_scale()
+        self.state_data["connect_radius"] = self._connect_radius()
+        self._dirty = True
+        self.rebuild_preview()
+
+    def _on_merge_connectors_change(self):
+        self.state_data["merge_connectors"] = self.merge_connectors_var.get()
+        self._dirty = True
+        self.rebuild_preview()
+
+    def _on_combine_carriageways_change(self):
+        self.state_data["combine_carriageways"] = self.combine_carriageways_var.get()
         self._dirty = True
         self.rebuild_preview()
 
@@ -1045,6 +1168,17 @@ class TrafficNodeEditor(tk.Tk):
         lines.append(f"Geometry source: Zones-mode profile-zone nodes; node widths are inherited from zone widths")
         lines.append(f"overObjects: {self.over_objects_var.get()}")
         lines.append(f"Decision connectors included: {self.include_decision_connectors_var.get()}")
+        lines.append(f"Combine lanes into one DecalRoad: {self.combine_carriageways_var.get()}")
+        lines.append(f"Node width scale: {self._width_scale()}")
+        lines.append(f"Merge junction connectors: {self.merge_connectors_var.get()}")
+        lines.append(f"Junctions as crossing roads: {self.junction_roads_var.get() and self.combine_carriageways_var.get()}"
+                     + ("" if self.combine_carriageways_var.get() or not self.junction_roads_var.get() else " (needs Combine opposing lanes)"))
+        for k, v in getattr(self, "junction_report", {}).items():
+            lines.append(f"  {k}: {v}")
+        lines.append(f"Node thinning (tolerance, max spacing): {self._thin_settings()}; nodes {getattr(self, 'thin_report', {})}")
+        if self.combine_carriageways_var.get():
+            for k, v in getattr(self, "carriageway_report", {}).items():
+                lines.append(f"  {k}: {v}")
         lines.append("")
         lines.append(f"Warnings ({len(p['warnings'])}):")
         for warning in p["warnings"][:1000]:
@@ -1077,7 +1211,8 @@ class TrafficNodeEditor(tk.Tk):
             if not math.isfinite(texture_length) or texture_length <= 0:
                 raise ValueError("Texture length must be positive and finite.")
             vertical_offset = float(self.vertical_offset_var.get())
-            if vertical_offset != self.preview["vertical_offset"]:
+            if vertical_offset != self.preview["vertical_offset"] or self._built_settings != (
+                    *self._thin_settings(), self.merge_connectors_var.get(), self._width_scale(), self._connect_radius()):
                 self.rebuild_preview()
         except ValueError as exc:
             messagebox.showerror("Export settings", str(exc)); return
@@ -1089,7 +1224,7 @@ class TrafficNodeEditor(tk.Tk):
             count = write_items_level(self.export_roads, path, material=material,
                                       texture_length=texture_length, render_priority=priority,
                                       over_objects=self.over_objects_var.get(),
-                                      vertical_offset=vertical_offset)
+                                      vertical_offset=vertical_offset, detail=self._road_detail())
             manifest_path = pathlib.Path(path).with_name(pathlib.Path(path).stem + ".source_manifest.json")
             write_source_manifest(self.export_roads, manifest_path, vertical_offset=vertical_offset)
             report_path = pathlib.Path(path).with_name(pathlib.Path(path).stem + ".report.json")
@@ -1103,6 +1238,16 @@ class TrafficNodeEditor(tk.Tk):
                       "warnings": self.preview["warnings"], "material": material,
                       "overObjects": self.over_objects_var.get(),
                       "include_decision_connectors": self.include_decision_connectors_var.get(),
+                      "combine_carriageways": self.combine_carriageways_var.get(),
+                      "merge_connectors": self.merge_connectors_var.get(),
+                      "detail": self._road_detail(),
+                      "node_width_scale": self._width_scale(),
+                      "connect_radius": self._connect_radius(),
+                      "junction_roads": self.junction_roads_var.get() and self.combine_carriageways_var.get(),
+                      "junctions": self.junction_report,
+                      "node_thinning": {"tolerance": self._thin_settings()[0], "max_spacing": self._thin_settings()[1],
+                                        **self.thin_report},
+                      "carriageways": self.carriageway_report,
                       "vertical_offset": vertical_offset,
                       "vertical_offset_applied_during_serialization": True,
                       "zone_endpoint_harmonization": self.zone_endpoint_report,

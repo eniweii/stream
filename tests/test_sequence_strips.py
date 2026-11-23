@@ -198,5 +198,106 @@ class PopulatorTandemTest(unittest.TestCase):
         self.assertEqual(self.materials["SIGN_D_WorldShader"]["Stages"][0]["animFlags"], 16)
 
 
+class AddFolderSequenceTest(unittest.TestCase):
+    """A sequence whose frames sit in emissive/add: one strip under emissive/add/animstrips, used as diffuse and emissive."""
+
+    ADD = PREFIX + "emissive/add/"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.textures = Path(self.tmp.name)
+        (self.textures / "emissive" / "add").mkdir(parents=True)
+        hashes = ["0x00000001", "0x00000002", "0x00000003"]
+        self.disk = {}
+        for i, h in enumerate(hashes):
+            name = f"{h}_ARROW_ANIM00{i + 1}.dds"
+            write_frame(self.textures / "emissive" / "add" / name, (60 * i, 10, 10, 255))
+            self.disk[h] = str(self.textures / "emissive" / "add" / name)
+        self.dictionary = {"textures": {h: {} for h in hashes},
+                           "animations": {"0xAB": {"name": "ARROW", "fps": 4, "timeBase": "World", "frames": hashes}}}
+        first = self.ADD + "0x00000001_ARROW_ANIM001.dds"
+        # the state plain Populate leaves for an add-folder stage
+        self.materials = {"ARROW_D_WorldShader": {"Stages": [{"baseColorMap": first, "emissiveMap": first,
+                                                               "emissiveFactor": [1, 1, 1], "emissiveIntensityNits": 2500,
+                                                               "vertColorEmissive": True}]}}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_once(self, old_lua):
+        log = []
+        if old_lua:
+            mod.revert_strips(self.materials, old_lua, log.append)
+        _changes, lua = populator.populate_animations(self.materials, self.dictionary, self.disk, str(self.textures), PREFIX, log=log.append)
+        strips, _n = mod.build_and_apply(self.materials, lua, str(self.textures), PREFIX, "fake", None, True, log.append, fake_texconv)
+        return lua, strips
+
+    def test_frames_list_their_diffuse_as_emissive(self):
+        _changes, lua = populator.populate_animations(self.materials, self.dictionary, self.disk, str(self.textures), PREFIX, log=lambda *_: None)
+        for frame in lua["animations"]["0xAB"]["frames"]:
+            self.assertEqual(frame["emissive"], frame["path"])
+
+    def test_one_strip_in_the_add_folder_is_diffuse_and_emissive(self):
+        lua, strips = self.run_once(None)
+        stage = self.materials["ARROW_D_WorldShader"]["Stages"][0]
+        self.assertTrue(stage["baseColorMap"].startswith(self.ADD + "animstrips/ANIMSTRIP_ARROW_"))
+        self.assertEqual(stage["emissiveMap"], stage["baseColorMap"])
+        self.assertEqual(stage["emissiveFactor"], [1, 1, 1])
+        self.assertTrue(stage["vertColorEmissive"])
+        self.assertEqual(stage["animFlags"], 24)
+        self.assertEqual(strips["0xAB"]["emissive"], strips["0xAB"]["path"])
+        files = sorted(p.name for p in (self.textures / "emissive" / "add" / "animstrips").iterdir())
+        self.assertEqual(len(files), 1)
+        self.assertFalse((self.textures / "animstrips").exists())
+        self.assertTrue(populator.stage_in_emissive_add(stage, None))
+
+    def test_stage_without_emissive_gets_it_from_populate_animations(self):
+        # materials.json rolled over from an older run: no emissive map, zeroed emission, no add alpha
+        stage = self.materials["ARROW_D_WorldShader"]["Stages"][0]
+        for key in ("emissiveMap", "vertColorEmissive"):
+            del stage[key]
+        stage["emissiveFactor"], stage["emissiveIntensityNits"] = [0, 0, 0], 0
+        changes, lua = populator.populate_animations(self.materials, self.dictionary, self.disk, str(self.textures), PREFIX, log=lambda *_: None)
+        self.assertGreaterEqual(changes, 1)
+        self.assertEqual(stage["emissiveMap"], stage["baseColorMap"])
+        self.assertEqual((stage["emissiveFactor"], stage["emissiveIntensityNits"], stage["vertColorEmissive"]), ([1, 1, 1], 2500, True))
+        self.assertEqual(self.materials["ARROW_D_WorldShader"]["translucentBlendOp"], "addAlpha")
+        self.assertTrue(lua["materials"]["ARROW_D_WorldShader"][0]["emissive"])
+        mod.build_and_apply(self.materials, lua, str(self.textures), PREFIX, "fake", None, True, lambda *_: None, fake_texconv)
+        self.assertTrue(stage["baseColorMap"].startswith(self.ADD + "animstrips/"))
+        self.assertEqual(stage["emissiveMap"], stage["baseColorMap"])
+
+    def test_non_add_sequence_is_left_without_emissive(self):
+        other = PREFIX + "0x00000001_ARROW_ANIM001.dds"
+        materials = {"PLAIN_D_WorldShader": {"Stages": [{"baseColorMap": other}]}}
+        disk = {h: p.replace(os.sep + "emissive" + os.sep + "add", "") for h, p in self.disk.items()}
+        populator.populate_animations(materials, self.dictionary, disk, str(self.textures), PREFIX, log=lambda *_: None)
+        self.assertNotIn("emissiveMap", materials["PLAIN_D_WorldShader"]["Stages"][0])
+        self.assertNotIn("translucentBlendOp", materials["PLAIN_D_WorldShader"])
+
+    def test_rerun_gives_the_same_result(self):
+        first_lua, _ = self.run_once(None)
+        first_materials = copy.deepcopy(self.materials)
+        second_lua, _ = self.run_once(json.loads(json.dumps(first_lua)))
+        self.assertEqual(self.materials, first_materials)
+        self.assertEqual(second_lua, first_lua)
+
+    def test_restore_puts_emissive_back_on_the_frame(self):
+        first_lua, _ = self.run_once(None)
+        mod.revert_strips(self.materials, json.loads(json.dumps(first_lua)))
+        stage = self.materials["ARROW_D_WorldShader"]["Stages"][0]
+        frame = self.ADD + "0x00000001_ARROW_ANIM001.dds"
+        self.assertEqual(stage["baseColorMap"], frame)
+        self.assertEqual(stage["emissiveMap"], frame)
+        self.assertNotIn("animFlags", stage)
+
+    def test_plain_populate_keeps_the_emissive_link_of_a_converted_stage(self):
+        self.run_once(None)
+        stage = self.materials["ARROW_D_WorldShader"]["Stages"][0]
+        entry = {"diffuse": stage["baseColorMap"]}
+        self.assertTrue(populator.is_emissive_add_path(entry["diffuse"]))
+        self.assertEqual(stage["emissiveMap"], stage["baseColorMap"])
+
+
 if __name__ == "__main__":
     unittest.main()

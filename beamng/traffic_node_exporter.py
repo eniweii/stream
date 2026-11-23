@@ -10,7 +10,8 @@ def sanitize_name(value):
 
 
 def corridor_to_decalroad(corridor, *, material="road_invisible", texture_length=8.0,
-                          render_priority=0, over_objects=None, vertical_offset=150.0):
+                          render_priority=0, over_objects=None, vertical_offset=150.0,
+                          detail=1.0):
     """Convert one already-derived corridor to a documented DecalRoad object.
 
     `corridor` is a complete continuous zone-derived path, already merged from
@@ -25,6 +26,9 @@ def corridor_to_decalroad(corridor, *, material="road_invisible", texture_length
     # without the project placement offset. Apply the +150 Z adjustment here,
     # exactly once, so the serialized items.level.json cannot silently omit it.
     offset = float(vertical_offset)
+    detail = float(detail)   # DecalRoad subdivision length; BeamNG default 0.1 is far too fine for invisible AI roads
+    if not (detail == detail and 0 < detail < float("inf")):
+        raise ValueError("detail must be a positive finite number")
     if not (offset == offset and abs(offset) != float("inf")):
         raise ValueError("vertical_offset must be a finite number")
     export_nodes = []
@@ -45,6 +49,7 @@ def corridor_to_decalroad(corridor, *, material="road_invisible", texture_length
         "oneWay": bool(corridor.get("one_way", True)),
         "flipDirection": False,
         "autoJunction": bool(corridor.get("auto_junction", True)),
+        "detail": detail,
         "useSubdivisions": True,
         "overObjects": bool(corridor.get("over_objects", False) if over_objects is None else over_objects),
         "improvedSpline": True,
@@ -57,7 +62,7 @@ def corridor_to_decalroad(corridor, *, material="road_invisible", texture_length
 
 
 def write_items_level(corridors, path, *, material="road_invisible", texture_length=8.0,
-                      render_priority=0, over_objects=None, vertical_offset=150.0):
+                      render_priority=0, over_objects=None, vertical_offset=150.0, detail=1.0):
     """Write one JSON object per line (BeamNG items.level.json format)."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -68,7 +73,7 @@ def write_items_level(corridors, path, *, material="road_invisible", texture_len
                                         texture_length=texture_length,
                                         render_priority=render_priority,
                                         over_objects=over_objects,
-                                        vertical_offset=vertical_offset)
+                                        vertical_offset=vertical_offset, detail=detail)
             if obj is None:
                 continue
             f.write(json.dumps(obj, separators=(",", ":"), allow_nan=False) + "\n")
@@ -90,7 +95,8 @@ def write_source_manifest(corridors, path, *, vertical_offset=150.0):
             "classification", "side", "drivability", "direction", "one_way", "auto_junction",
             "auto_lanes", "lanes_left", "lanes_right", "source_decision", "source_no_traffic",
             "force_export", "export", "offset_start", "offset_end", "width_start", "width_end",
-            "over_objects", "segment_flags", "zone_endpoint_harmonized", "max_source_endpoint_gap")})
+            "over_objects", "segment_flags", "zone_endpoint_harmonized", "max_source_endpoint_gap",
+            "combined", "combined_source_keys", "combined_lane_count", "combined_median_count")})
     payload = {
         "schema_version": 2,
         "geometry_source": "CARP profile zones as rendered in Zones mode; connected through-road pieces are merged by source graph topology",

@@ -24,6 +24,17 @@ Needs texconv.exe next to this script (or --texconv) and Pillow. Frames are deco
 Pillow and encoded again with texconv in the format of the first frame, with a full mip chain. No colour
 conversion is asked of texconv, so the pixels are only recompressed.
 
+A sequence whose frames sit in an emissive/add folder (the diffuse is also the emissive map) gets one strip under
+emissive/add/animstrips/, used as baseColorMap and emissiveMap alike, so the folder rule of the populator
+(additive alpha, emissiveMap = baseColorMap) still holds for the strip and a re-run keeps it.
+
+Half-UV sequences ("halfUv" entries of the populator, a timestep-driven scroll that jumps half a UV per step):
+the frames are the texture and the same texture shifted half a UV with wrap ({"shift": "U"} or "V", no file), so
+the strip has 2 cells and runs at 1 / step seconds. The stage's scroll flag is switched off while the strip is on
+(the scroll fields stay for the frame swap and for the revert). UVs outside 0..1 (tiled meshes) would show the
+neighbouring cell: list such a sequence in --exclude (its key like half_0xAE651288 or its name) and its stages
+keep the scroll.
+
 Stage fields written (BeamNG v1.5 stage):
     baseColorMap, emissiveMap (when the stage has one and the sequence has emissive frames)
     animFlags            Sequence (16) + Scale (8), added to a scroll flag that is already there
@@ -48,11 +59,12 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageChops
 
 # texconv.exe is expected to sit next to this script, not on PATH
 TEXCONV_DEFAULT = Path(__file__).resolve().parent / "texconv.exe"
 
+SCROLL_ANIM_FLAG = 1
 SEQUENCE_ANIM_FLAG = 16       # Torque Material animFlags: Scroll 1, Rotate 2, Wave 4, Scale 8, Sequence 16
 SCALE_ANIM_FLAG = 8           # with Scale the mesh UV may cover the whole strip
 STRIP_FOLDER = "animstrips"   # created under the texture folder
@@ -115,8 +127,19 @@ def detect_base_prefix(animations, texture_root):
     return ""
 
 
+def is_emissive_add_path(path):
+    parts = [p.lower() for p in re.split(r"[\\/]+", path or "")]
+    return any(a == "emissive" and b == "add" for a, b in zip(parts, parts[1:]))
+
+
 def safe_name(text):
     return re.sub(r"[^A-Za-z0-9_]+", "_", text or "").strip("_") or "SEQ"
+
+
+def shift_half(image, axis):
+    """The image shifted half its size along U or V, wrapping around."""
+    width, height = image.size
+    return ImageChops.offset(image, width // 2, 0) if axis == "U" else ImageChops.offset(image, 0, height // 2)
 
 
 def join_strip(images, cell_size, fill=(0, 0, 0, 255)):
@@ -133,12 +156,13 @@ def join_strip(images, cell_size, fill=(0, 0, 0, 255)):
 
 
 def build_strip_file(texconv, runner, sources, out_dir, stem, log, fill=(0, 0, 0, 255)):
-    """sources: disk paths (None = missing frame). Writes out_dir/<stem>.dds and returns (cells, cell_w, cell_h)."""
-    fmt = dds_format(next(s for s in sources if s))
+    """sources: disk paths (None = missing frame, ("shift", "U" or "V") = the first frame shifted half a UV).
+    Writes out_dir/<stem>.dds and returns (cells, cell_w, cell_h)."""
+    fmt = dds_format(next(s for s in sources if isinstance(s, str)))
     images = []
     with tempfile.TemporaryDirectory() as tmp:
         for i, source in enumerate(sources):
-            if not source:
+            if not source or isinstance(source, tuple):
                 images.append(None)
                 continue
             frame_dir = os.path.join(tmp, f"f{i}")
@@ -147,6 +171,10 @@ def build_strip_file(texconv, runner, sources, out_dir, stem, log, fill=(0, 0, 0
             png = os.path.join(frame_dir, Path(source).stem + ".png")
             with Image.open(png) as img:
                 images.append(img.convert("RGBA"))
+        for i, source in enumerate(sources):
+            if isinstance(source, tuple):
+                base = next((img for img in images if img is not None), None)
+                images[i] = shift_half(base, source[1]) if base is not None else None
         sizes = [img.size for img in images if img is not None]
         cell = (max(s[0] for s in sizes), max(s[1] for s in sizes))
         if len(set(sizes)) > 1:
@@ -184,7 +212,6 @@ def build_strips(anim_data, texture_root, base_prefix, texconv, exclude=None, lo
     animations = anim_data.get("animations") or {}
     keys, used = wanted_animations(anim_data, exclude)
     strips = {}
-    out_dir = os.path.join(texture_root, STRIP_FOLDER)
     for key in keys:
         anim = animations[key]
         name = safe_name(anim.get("name") or key)
@@ -193,27 +220,36 @@ def build_strips(anim_data, texture_root, base_prefix, texconv, exclude=None, lo
         try:
             if len(frames) < 2:
                 raise ValueError("fewer than two frames")
-            diffuse = [disk_path_for(f.get("path"), base_prefix, texture_root) for f in frames]
-            missing = [i + 1 for i, d in enumerate(diffuse) if not d or not os.path.isfile(d)]
+            diffuse = [("shift", f["shift"]) if f.get("shift") else disk_path_for(f.get("path"), base_prefix, texture_root)
+                       for f in frames]
+            missing = [i + 1 for i, d in enumerate(diffuse) if not d or not (isinstance(d, tuple) or os.path.isfile(d))]
             if missing:
                 raise ValueError(f"no texture file for frame(s) {missing}")
             stem = f"ANIMSTRIP_{name}_{key.replace('0x', '').replace('0X', '')}"
-            block = {"path": f"{base_prefix}{STRIP_FOLDER}/{stem}.dds", "cells": len(frames), "segment": round(1.0 / len(frames), 8)}
+            # frames in an emissive/add folder: the strip stays in that folder, so the add rules still see it
+            add_sequence = all(is_emissive_add_path(f.get("path")) for f in frames if not f.get("shift"))
+            strip_folder = f"emissive/add/{STRIP_FOLDER}" if add_sequence else STRIP_FOLDER
+            out_dir = os.path.join(texture_root, *strip_folder.split("/"))
+            block = {"path": f"{base_prefix}{strip_folder}/{stem}.dds", "cells": len(frames), "segment": round(1.0 / len(frames), 8)}
             has_emissive_stage = any(e.get("emissive") for e in used[key])
             emissive = [disk_path_for(f.get("emissive"), base_prefix, texture_root) for f in frames]
             emissive = [e if e and os.path.isfile(e) else None for e in emissive]
+            emissive = [(("shift", f["shift"]) if emissive[0] else None) if f.get("shift") else e
+                        for f, e in zip(frames, emissive)]
             if dry_run:
                 cells, cw, ch = len(frames), 0, 0
             else:
                 cells, cw, ch = build_strip_file(texconv, runner, diffuse, out_dir, stem, log)
             block.update({"cellWidth": cw, "cellHeight": ch})
-            if has_emissive_stage and any(emissive):
+            if has_emissive_stage and add_sequence and emissive == diffuse:
+                block["emissive"] = block["path"]       # the diffuse strip is the emissive strip
+            elif has_emissive_stage and any(emissive):
                 absent = [i + 1 for i, e in enumerate(emissive) if not e]
                 if absent:
                     log(f"    no emissive file for frame(s) {absent}; those cells are black in the emissive strip")
                 if not dry_run:
                     build_strip_file(texconv, runner, emissive, out_dir, stem + "_emissive", log)
-                block["emissive"] = f"{base_prefix}{STRIP_FOLDER}/{stem}_emissive.dds"
+                block["emissive"] = f"{base_prefix}{strip_folder}/{stem}_emissive.dds"
             elif has_emissive_stage:
                 log("    the stages have an emissive map but no frame has an emissive file; the emissive map stays as it is")
             strips[key] = block
@@ -254,7 +290,10 @@ def apply_strips(materials_data, anim_data, strips, use_scale=True, log=print):
                 continue
             old_flags = stage.get("animFlags") if isinstance(stage.get("animFlags"), int) else 0
             flags_off = old_flags & ~added
-            wanted = {"baseColorMap": block["path"], "animFlags": flags_off | added,
+            flags_on = flags_off | added
+            if entry.get("halfUv"):
+                flags_on &= ~SCROLL_ANIM_FLAG       # the strip does the jumping, a scroll on top would move it again
+            wanted = {"baseColorMap": block["path"], "animFlags": flags_on,
                       "sequenceFramePerSec": float(animations[entry["animation"]].get("fps") or 0),
                       "sequenceSegmentSize": block["segment"]}
             if stage.get("emissiveMap") and block.get("emissive"):
@@ -262,7 +301,7 @@ def apply_strips(materials_data, anim_data, strips, use_scale=True, log=print):
             if any(stage.get(k) != v for k, v in wanted.items()):
                 stage.update(wanted)
                 changed += 1
-            entry["sequence"] = {"flagsOn": flags_off | added, "flagsOff": flags_off}
+            entry["sequence"] = {"flagsOn": flags_on, "flagsOff": flags_off}
     anim_data["version"] = max(3, int(anim_data.get("version") or 0))
     anim_data["notes"] = (str(anim_data.get("notes") or "").split(" Strips:")[0] +
                           " Strips: a sequence with a strip block can run natively (the strip is written on its stages, "

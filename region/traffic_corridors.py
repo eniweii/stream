@@ -491,7 +491,7 @@ def harmonize_zone_endpoints(corridors):
     return {"snapped_endpoint_groups": snapped_groups, "max_pre_snap_gap": round(largest_gap, 4)}
 
 
-def merge_connected_corridors(corridors, *, endpoint_tolerance=0.75):
+def merge_connected_corridors(corridors, *, endpoint_tolerance=0.75, merge_decision=False):
     """Create one DecalRoad for each continuous, compatible lane-zone chain.
 
     Geometry comes directly from the same per-zone sample arrays rendered in
@@ -505,6 +505,11 @@ def merge_connected_corridors(corridors, *, endpoint_tolerance=0.75):
     chain. Position and width live in the node array; objects are not emitted
     per node. The parameter endpoint_tolerance is retained for API compatibility
     and diagnostics but is not used to reject topologically valid joins.
+
+    merge_decision=True also lets Decision connectors take part in chains: a connector
+    joins the road it leads into (or the one that leads into it) when the link is
+    unique (one successor, one predecessor, same road-level signature). Real branches,
+    where several connectors leave or arrive at the same lane, stay split.
     """
     del endpoint_tolerance  # topology is authoritative; geometry gaps are snapped separately
     eligible = [c for c in corridors if c.get("export", False) and not c.get("excluded", False)
@@ -519,7 +524,10 @@ def merge_connected_corridors(corridors, *, endpoint_tolerance=0.75):
         road_id = int(c.get("road_id", -1))
         start_node, end_node, start_zone, end_zone = _oriented_source_endpoints(c)
         oriented[i] = (start_node, end_node, start_zone, end_zone)
-        can_join = (road_id >= 0 and not c.get("source_decision", False)
+        joinable_source = road_id >= 0 and not c.get("source_decision", False)
+        if merge_decision and c.get("source_decision", False):
+            joinable_source = True
+        can_join = (joinable_source
                     and (not c.get("source_no_traffic", False) or c.get("force_export", False)))
         if not can_join:
             continue
@@ -580,6 +588,7 @@ def merge_connected_corridors(corridors, *, endpoint_tolerance=0.75):
             chains.append(walk(i))
 
     out = []
+    used_ids = set()
     for chain in chains:
         first = eligible[chain[0]]
         merged = dict(first)
@@ -612,8 +621,16 @@ def merge_connected_corridors(corridors, *, endpoint_tolerance=0.75):
         if road_id >= 0 and len(chain) > 1:
             merged_id = (f"road_{road_id}_zone_{first.get('zone_index', -1)}_"
                          f"from_{first.get('segment_index', chain[0])}")
+        elif len(chain) > 1:
+            merged_id = f"{first.get('id', f'zone_{chain[0]}')}_chain{len(chain)}"
         else:
             merged_id = str(first.get("id", f"zone_{chain[0]}"))
+        if merged_id in used_ids:      # junction roads inherit the segment/zone of their arm
+            n = 2
+            while f"{merged_id}_{n}" in used_ids:
+                n += 1
+            merged_id = f"{merged_id}_{n}"
+        used_ids.add(merged_id)
         merged.update({
             "id": merged_id,
             "source_key": source_keys[0],
@@ -634,4 +651,652 @@ def merge_connected_corridors(corridors, *, endpoint_tolerance=0.75):
 
     out.sort(key=lambda c: (int(c.get("road_id", -1)), int(c.get("segment_index", -1)),
                             int(c.get("zone_index", -1)), str(c.get("id", ""))))
+    return out
+
+
+COMBINE_LANE_TYPES = (1, 10)   # traffic and general road lanes can share one DecalRoad
+COMBINE_MEDIAN_TYPE = 4        # dead median: becomes part of the road width, not a road
+
+
+def _lane_at(corridor, t):
+    """Lateral offset and width of a zone corridor at fraction t (segment order a -> b)."""
+    off = corridor["offset_start"] + (corridor["offset_end"] - corridor["offset_start"]) * t
+    width = corridor["width_start"] + (corridor["width_end"] - corridor["width_start"]) * t
+    return off, width
+
+
+def _forward_nodes(corridor):
+    """Zone nodes in segment order (a -> b); reverse-direction lanes are stored flipped."""
+    nodes = corridor["nodes"]
+    return nodes[::-1] if corridor.get("direction") == "reverse" else nodes
+
+
+def combine_carriageways(corridors):
+    """Replace the lanes of a segment that flow the same way by ONE DecalRoad.
+
+    Per segment, the traffic lanes (types 1 and 10) become one road. The nodes sit on the
+    middle of the whole carriageway and the node width runs from the outer edge of the
+    outermost lane to the outer edge of the outermost lane on the other side, so a median
+    (zone type 4) between the lanes is a dead gap inside the width and is not exported as a
+    road of its own. Only the number of lanes on each side matters to BeamNG:
+
+    * two-way segment: lanes_left / lanes_right = the lanes on each side, one_way False,
+      also when the sides are uneven (4 left, 2 right);
+    * one-sided segment (flagged one-way, or all lanes on one side): one_way True and every
+      lane on one road, lanes_right = n when the traffic flows along the nodes, lanes_left = n
+      when it flows against them; the node order is never reversed.
+
+    Sidewalks, shoulders and every other zone stay separate roads exactly as before. A segment
+    keeps the one-lane-per-road export when it is a decision connector or NoTraffic, a lane
+    has an override, or the lanes differ in node count. A segment with a single lane is
+    already one road. Works on the corridors after harmonize_zone_endpoints() and returns
+    (corridors_for_export, report). The input corridors are not modified.
+    """
+    by_segment = {}
+    for c in corridors:
+        by_segment.setdefault(int(c.get("segment_index", -1)), []).append(c)
+
+    consumed, combined = set(), []
+    skipped, kinds = {}, {}
+
+    def skip(reason):
+        skipped[reason] = skipped.get(reason, 0) + 1
+
+    for seg_i, group in by_segment.items():
+        lanes = [c for c in group if c.get("export", False) and not c.get("excluded", False)
+                 and int(c.get("source_type", -1)) in COMBINE_LANE_TYPES
+                 and int(c.get("source_type_end", c.get("source_type", -1))) in COMBINE_LANE_TYPES
+                 and len(c.get("nodes") or []) >= 2]
+        if len(lanes) < 2:
+            continue   # one lane is already one road
+        flags = int(group[0].get("segment_flags", 0))
+        if flags & (FLAG_DECISION | FLAG_NO_TRAFFIC):
+            skip("decision or NoTraffic segment")
+            continue
+        if any(c.get("override") for c in lanes):
+            skip("lane has a pattern or local override")
+            continue
+        if len({len(c["nodes"]) for c in lanes}) != 1:
+            skip("lanes differ in node count")
+            continue
+        left = [c for c in lanes if c.get("side") == "left"]
+        right = [c for c in lanes if c.get("side") == "right"]
+        # A median between the lanes becomes the dead gap; any other zone there stays its own road.
+        lo = min(min(c["offset_start"], c["offset_end"]) for c in lanes)
+        hi = max(max(c["offset_start"], c["offset_end"]) for c in lanes)
+        lane_ids = {id(c) for c in lanes}
+        medians = []
+        for c in group:
+            if id(c) in lane_ids:
+                continue
+            mid = (c["offset_start"] + c["offset_end"]) * 0.5
+            if lo < mid < hi and int(c.get("source_type", -1)) == COMBINE_MEDIAN_TYPE:
+                medians.append(c)
+
+        one_sided = bool(flags & FLAG_ONE_WAY) or not left or not right
+        if one_sided:
+            # all lanes flow the same way; lanes_left = traffic against the node order
+            against = bool(not (flags & FLAG_ONE_WAY) and left and not right)
+            lanes_left, lanes_right, one_way = (len(lanes), 0, True) if against else (0, len(lanes), True)
+            anchor = min(lanes, key=lambda c: abs(c["offset_start"]))
+            kind = "one-way segment" if flags & FLAG_ONE_WAY else "one-sided profile"
+        else:
+            lanes_left, lanes_right, one_way = len(left), len(right), False
+            anchor = min(right, key=lambda c: c["offset_start"])
+            kind = "two-way even" if len(left) == len(right) else "two-way uneven"
+
+        forward = [(c, _forward_nodes(c)) for c in lanes]
+        count = len(forward[0][1])
+        nodes, off_first, off_last, ok = [], 0.0, 0.0, True
+        for i in range(count):
+            t = i / (count - 1)
+            info = [(_lane_at(c, t), ns[i]) for c, ns in forward]
+            edge_min = min(off - w * 0.5 for (off, w), _p in info)
+            edge_max = max(off + w * 0.5 for (off, w), _p in info)
+            (off_a, _wa), pa = min(info, key=lambda it: it[0][0])
+            (off_b, _wb), pb = max(info, key=lambda it: it[0][0])
+            if off_b - off_a < 1e-6:
+                ok = False
+                break
+            centre = (edge_min + edge_max) * 0.5
+            f = (centre - off_a) / (off_b - off_a)
+            nodes.append([round(pa[k] + (pb[k] - pa[k]) * f, 4) for k in range(3)]
+                         + [round(max(0.05, edge_max - edge_min), 4)])
+            if i == 0:
+                off_first = centre
+            off_last = centre
+        if not ok:
+            skip("lanes share one lateral position")
+            continue
+
+        road = dict(anchor)
+        keys = [str(c.get("source_key")) for c in lanes + medians]
+        label = ("%d lanes one-way" % len(lanes)) if one_sided else ("%d+%d lanes" % (lanes_left, lanes_right))
+        road.update({
+            "id": f"carriageway_{seg_i}", "source_key": str(anchor.get("source_key")),
+            "classification": f"Carriageway ({label})", "side": "both",
+            "direction": "forward", "one_way": one_way, "auto_lanes": False,
+            "lanes_left": lanes_left, "lanes_right": lanes_right,
+            "drivability": max(float(c.get("drivability", 0.0)) for c in lanes),
+            "nodes": nodes, "width_start": nodes[0][3], "width_end": nodes[-1][3],
+            "offset_start": round(off_first, 4), "offset_end": round(off_last, 4),
+            "combined": True, "combined_kind": kind, "combined_source_keys": keys,
+            "combined_lane_count": len(lanes), "combined_median_count": len(medians),
+            "override": {}, "export": True,
+        })
+        combined.append(road)
+        kinds[kind] = kinds.get(kind, 0) + 1
+        consumed.update(id(c) for c in lanes + medians)
+
+    out = [c for c in corridors if id(c) not in consumed] + combined
+    report = {"combined_segments": len(combined), "kinds": kinds,
+              "lane_corridors_replaced": sum(r["combined_lane_count"] for r in combined),
+              "median_corridors_dropped": sum(r["combined_median_count"] for r in combined),
+              "skipped_segments": skipped}
+    return out, report
+
+
+def _dist3(a, b):
+    return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2)
+
+
+def thin_nodes(nodes, tolerance=0.15, max_spacing=25.0, width_tolerance=None):
+    """Drop nodes that a straight piece between their neighbours reproduces.
+
+    Douglas-Peucker over x/y/z and node width: a node is kept when it is further than
+    `tolerance` metres from the straight line between the kept nodes around it (width:
+    half the width difference to the interpolated width). The first and last node are
+    always kept, so road ends and shared junction points do not move. `max_spacing`
+    (metres, 0 = off) keeps long straight pieces from losing every node in between.
+    `width_tolerance` (default = tolerance) is the allowed difference between a node's width
+    and the width interpolated from its kept neighbours, as half the difference in metres, so
+    small width wobbles do not keep every node of a straight road.
+    tolerance <= 0 returns the nodes unchanged.
+    """
+    count = len(nodes)
+    if count <= 2 or tolerance <= 0:
+        return nodes
+    wtol = tolerance if width_tolerance is None else max(float(width_tolerance), 0.0)
+    cum = [0.0]
+    for i in range(1, count):
+        cum.append(cum[-1] + _dist3(nodes[i - 1], nodes[i]))
+    keep, stack = {0, count - 1}, [(0, count - 1)]
+    while stack:
+        i, j = stack.pop()
+        if j - i < 2:
+            continue
+        a, b = nodes[i], nodes[j]
+        ab = [b[m] - a[m] for m in range(3)]
+        ab2 = sum(v * v for v in ab)
+        span = cum[j] - cum[i]
+        worst, worst_dev = -1, -1.0
+        for k in range(i + 1, j):
+            p = nodes[k]
+            ap = [p[m] - a[m] for m in range(3)]
+            t = sum(ap[m] * ab[m] for m in range(3)) / ab2 if ab2 > 1e-12 else 0.0
+            t = max(0.0, min(1.0, t))
+            dev = math.sqrt(sum((ap[m] - t * ab[m]) ** 2 for m in range(3)))
+            u = (cum[k] - cum[i]) / span if span > 1e-9 else 0.0
+            wdev = abs(p[3] - (a[3] + (b[3] - a[3]) * u)) * 0.5
+            d = max(dev / tolerance, wdev / wtol if wtol > 0 else (math.inf if wdev > 0 else 0.0))
+            if d > worst_dev:
+                worst, worst_dev = k, d
+        if worst_dev > 1.0:
+            split = worst
+        elif max_spacing > 0 and span > max_spacing:
+            mid = cum[i] + span * 0.5
+            split = min(range(i + 1, j), key=lambda k: abs(cum[k] - mid))
+        else:
+            continue
+        keep.add(split)
+        stack.append((i, split))
+        stack.append((split, j))
+    return [nodes[k] for k in sorted(keep)]
+
+
+def thin_roads(roads, tolerance=0.15, max_spacing=25.0, width_tolerance=None):
+    """thin_nodes() for every merged road. Returns (roads, {"nodes_before", "nodes_after"})."""
+    before = after = 0
+    out = []
+    for road in roads:
+        nodes = road.get("nodes") or []
+        thinned = thin_nodes(nodes, tolerance, max_spacing, width_tolerance)
+        before += len(nodes)
+        after += len(thinned)
+        if thinned is nodes:
+            out.append(road)
+        else:
+            road = dict(road)
+            road["nodes"] = thinned
+            out.append(road)
+    return out, {"nodes_before": before, "nodes_after": after}
+
+
+def _seg_param(p, a, b):
+    """Closest point parameter of p on segment a-b (2D) and the distance to it."""
+    abx, aby = b[0] - a[0], b[1] - a[1]
+    ab2 = abx * abx + aby * aby
+    t = 0.0 if ab2 < 1e-9 else ((p[0] - a[0]) * abx + (p[1] - a[1]) * aby) / ab2
+    t = max(0.0, min(1.0, t))
+    return t, math.hypot(p[0] - (a[0] + abx * t), p[1] - (a[1] + aby * t))
+
+
+def _seg_cross(a, b, c, d):
+    """Parameters (t on a-b, u on c-d) when the two 2D segments properly cross, else None."""
+    rx, ry, sx, sy = b[0] - a[0], b[1] - a[1], d[0] - c[0], d[1] - c[1]
+    den = rx * sy - ry * sx
+    if abs(den) < 1e-9:
+        return None
+    t = ((c[0] - a[0]) * sy - (c[1] - a[1]) * sx) / den
+    u = ((c[0] - a[0]) * ry - (c[1] - a[1]) * rx) / den
+    return (t, u) if 0.02 < t < 0.98 and 0.02 < u < 0.98 else None
+
+
+def _lerp_node(a, b, t):
+    return [round(a[k] + (b[k] - a[k]) * t, 4) for k in range(4)]
+
+
+RUNOFF_TYPE = 3   # sidewalk / shoulder lanes: their own roads, extended at junctions
+
+
+def _arm_flow(c, into):
+    """True/False when traffic flows into/out of the junction on a one-way arm, None on two-way."""
+    left, right = int(c.get("lanes_left", 0)), int(c.get("lanes_right", 1))
+    if not c.get("one_way", False) or (left and right):
+        return None
+    return into if right else (not into)
+
+
+def resolve_junctions(corridors, *, min_opposite_dot=-0.3, connect_radius=50.0):
+    """Replace junction connectors by roads that end on / cross the through road.
+
+    This is how hand-made BeamNG AI maps do it: no turning connectors, the roads of a
+    junction simply meet and BeamNG's autoJunction lets the AI choose. Works on the
+    output of combine_carriageways(), per junction (cluster of nodes joined by Decision
+    connectors, 3+ arms):
+
+    * every arm must be a combined road, otherwise the junction keeps its traffic connectors;
+    * opposite arms (direction dot product below `min_opposite_dot`) with the same lane
+      configuration become one through road, passing a node on the chord between the two
+      arm ends. Two-way arms pair with two-way arms; one-way arms only pair with a one-way
+      arm of the opposite flow (entering with leaving), never two entering arms;
+    * two through roads that cross share a node at the crossing (4-way);
+    * every remaining arm becomes a short stem that keeps its heading and ends on a node
+      placed on the nearest through road (T); an entering one-way stem merges onto it, a
+      leaving one starts from it. Without any through road the arms end together at the
+      middle of their ends;
+    * the traffic and median Decision connectors of the junction are dropped.
+
+    Runoffs (zone type 3, sidewalks and shoulders) stay their own roads. In every junction
+    their sidewalk/shoulder connectors are dropped and their ends are extended so each has a
+    pair: opposite runoff ends join, other ends run on along their heading to a joined pair or
+    to the nearest road, and an end that still has no pair joins the nearest runoff end.
+    The extension pieces are two-way (lanes on either side).
+
+    connect_radius (metres, 0 = unlimited) limits every connection to the nearest partner of
+    the same kind: a through road, stem or runoff piece is only made when its length is within
+    the radius. A junction with an arm that cannot be connected within the radius (a big
+    interchange) is left unchanged and keeps its original connectors.
+
+    The short junction roads keep the arms' node/zone identity wherever the direction of
+    travel allows it, so merge_connected_corridors() chains them into the arm roads.
+    Returns (corridors_for_export, report). The input corridors are not modified.
+    """
+    radius = float(connect_radius) if connect_radius and connect_radius > 0 else float("inf")
+    live = [c for c in corridors if c.get("export", False) and not c.get("excluded", False)]
+    parent = {}
+
+    def find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    decisions = [c for c in live if c.get("source_decision")]
+    for c in decisions:
+        parent[find(int(c["node_start"]))] = find(int(c["node_end"]))
+    touching, runoff_touching = {}, {}
+    lanes_in_segment = {}
+    for c in live:
+        if (not c.get("source_decision") and not c.get("combined")
+                and int(c.get("source_type", -1)) in COMBINE_LANE_TYPES):
+            seg = int(c.get("segment_index", -1))
+            lanes_in_segment[seg] = lanes_in_segment.get(seg, 0) + 1
+    for c in live:
+        if c.get("source_decision"):
+            continue
+        kind = int(c.get("source_type", -1))
+        for n in {int(c["node_start"]), int(c["node_end"])}:
+            if n not in parent:
+                continue
+            if c.get("combined") or kind in COMBINE_LANE_TYPES:
+                touching.setdefault(find(n), []).append((c, n))
+            elif kind == RUNOFF_TYPE:
+                runoff_touching.setdefault(find(n), []).append((c, n))
+    clusters = {}
+    for n in list(parent):
+        clusters.setdefault(find(n), set()).add(n)
+
+    skipped, consumed_ids, added = {}, set(), []
+    stats = {"junctions_resolved": 0, "through_roads": 0, "stems_on_road": 0, "crossings": 0,
+             "arms_meeting_at_middle": 0, "runoff_pieces": 0, "runoff_ends_without_pair": 0}
+    sentinel = [0]
+
+    def free_node():
+        sentinel[0] += 1
+        return -sentinel[0]
+
+    def skip(reason):
+        skipped[reason] = skipped.get(reason, 0) + 1
+
+    def inside(c, nodes):
+        return int(c["node_start"]) in nodes and int(c["node_end"]) in nodes
+
+    for root in sorted(clusters):
+        cluster_nodes = clusters[root]
+        arms = touching.get(root, [])
+        main_roads = []                          # polylines the runoff ends may run onto
+        resolved = False
+        if len(arms) >= 3:
+            if not all(c.get("combined") or lanes_in_segment.get(int(c.get("segment_index", -1)), 0) == 1
+                       for c, _n in arms):
+                skip("an arm is not a combined road")
+            elif any(inside(c, cluster_nodes) for c, _n in arms):
+                skip("an arm connects two junction nodes")
+            else:
+                resolved = True
+        if resolved:
+            info = []
+            for c, n in arms:
+                sa, sb, za, zb = _oriented_source_endpoints(c)   # travel order, also for reverse lanes
+                into = sb == n                                    # the traffic of this arm ends at the junction
+                nodes = [list(map(float, p)) for p in c["nodes"]]
+                toward = nodes if into else nodes[::-1]
+                end = toward[-1]
+                back = next((p for p in reversed(toward[:-1]) if math.hypot(p[0] - end[0], p[1] - end[1]) >= 3.0), toward[0])
+                dx, dy = end[0] - back[0], end[1] - back[1]
+                length = math.hypot(dx, dy) or 1.0
+                one_way = bool(c.get("one_way", False))
+                lanes = (int(c.get("lanes_left", 0)), int(c.get("lanes_right", 1)))
+                info.append({"c": c, "node": n, "into": into, "toward": toward, "end": end,
+                             "raw_end": int(zb), "raw_start": int(za),
+                             "dir": (dx / length, dy / length), "flow_in": _arm_flow(c, into),
+                             "lanes": lanes, "one_way": one_way,
+                             # the arm piece can be chained into when its flow runs along the node order
+                             "chain": (not one_way) or lanes[1] > 0})
+                main_roads.append(nodes)
+
+            def compatible(a, b):
+                if a["flow_in"] is None and b["flow_in"] is None:
+                    return a["lanes"] == b["lanes"]
+                if a["flow_in"] is None or b["flow_in"] is None:
+                    return False
+                return a["flow_in"] != b["flow_in"] and sum(a["lanes"]) == sum(b["lanes"])
+
+            pairs, free = [], set(range(len(info)))
+            order = sorted((info[i]["dir"][0] * info[j]["dir"][0] + info[i]["dir"][1] * info[j]["dir"][1], i, j)
+                           for i in range(len(info)) for j in range(i + 1, len(info)))
+            for dot, i, j in order:
+                if dot >= min_opposite_dot:
+                    break
+                gap = math.hypot(info[i]["end"][0] - info[j]["end"][0], info[i]["end"][1] - info[j]["end"][1])
+                if gap > radius:
+                    continue
+                if i in free and j in free and compatible(info[i], info[j]):
+                    pairs.append((i, j))
+                    free -= {i, j}
+
+            base_id = f"junction_{root}"
+            through = []
+            for i, j in pairs:
+                a, b = info[i]["end"], info[j]["end"]
+                through.append({"i": i, "j": j, "a": a, "b": b, "inserts": [],
+                                "degenerate": math.hypot(a[0] - b[0], a[1] - b[1]) < 1.0})
+            live_through = [t for t in through if not t["degenerate"]]
+            crossings_found = 0
+            if len(live_through) >= 2:
+                hit = _seg_cross(live_through[0]["a"], live_through[0]["b"], live_through[1]["a"], live_through[1]["b"])
+                if hit:
+                    t0, t1 = hit
+                    n0 = _lerp_node(live_through[0]["a"], live_through[0]["b"], t0)
+                    n1 = _lerp_node(live_through[1]["a"], live_through[1]["b"], t1)
+                    shared = [round((n0[k] + n1[k]) * 0.5, 4) for k in range(4)]
+                    live_through[0]["inserts"].append((t0, shared))
+                    live_through[1]["inserts"].append((t1, list(shared)))
+                    crossings_found = 1
+            stems = []
+            if through:
+                for s in sorted(free):
+                    end = info[s]["end"]
+                    best = min(((_seg_param(end, t["a"], t["b"])[1], k) for k, t in enumerate(through)))
+                    t = through[best[1]]
+                    if t["degenerate"]:
+                        point = [round(v, 4) for v in t["a"][:3]] + [end[3]]
+                    else:
+                        d = info[s]["dir"]
+                        ahead = _seg_cross(end, [end[0] + d[0] * 120.0, end[1] + d[1] * 120.0], t["a"], t["b"])
+                        if ahead:
+                            tt = ahead[1]            # the stem keeps its heading up to the through road
+                        else:
+                            tt, _d = _seg_param(end, t["a"], t["b"])
+                        tt = max(0.05, min(0.95, tt))
+                        point = _lerp_node(t["a"], t["b"], tt)
+                        point[3] = end[3]
+                        t["inserts"].append((tt, _lerp_node(t["a"], t["b"], tt)))
+                    stems.append((s, point))
+            else:
+                mx = sum(info[s]["end"][0] for s in free) / len(free)
+                my = sum(info[s]["end"][1] for s in free) / len(free)
+                mz = sum(info[s]["end"][2] for s in free) / len(free)
+                for s in sorted(free):
+                    stems.append((s, [round(mx, 4), round(my, 4), round(mz, 4), info[s]["end"][3]]))
+            reach = max([math.hypot(info[s]["end"][0] - pt[0], info[s]["end"][1] - pt[1]) for s, pt in stems]
+                        + [math.hypot(t["a"][0] - t["b"][0], t["a"][1] - t["b"][1]) for t in through])
+            if reach > radius:
+                skip("an arm is farther than the connection radius")
+                resolved = False
+                main_roads = []
+        if resolved:
+            stats["crossings"] += crossings_found
+            if through:
+                stats["stems_on_road"] += len(stems)
+            else:
+                stats["arms_meeting_at_middle"] += len(free)
+
+            def junction_road(source, nodes, start_id, end_id, suffix, lanes, one_way):
+                road = dict(source)
+                road.update({
+                    "id": f"{base_id}_{suffix}", "source_key": f"junction:{root}:{suffix}",
+                    "nodes": [[round(v, 4) for v in p] for p in nodes], "direction": "forward",
+                    "node_start": start_id[0], "node_end": end_id[0],
+                    "zone_raw_start": start_id[1], "zone_raw_end": end_id[1],
+                    "zone_index": start_id[1] if start_id[1] >= 0 else end_id[1],
+                    "width_start": nodes[0][3], "width_end": nodes[-1][3],
+                    "lanes_left": lanes[0], "lanes_right": lanes[1], "one_way": one_way,
+                    "combined_junction": True, "override": {}, "export": True,
+                })
+                return road
+
+            def flow_lanes(a):
+                """Lane configuration of a junction road that follows the arm's traffic."""
+                return ((0, sum(a["lanes"])), True) if a["one_way"] else (a["lanes"], False)
+
+            new_roads = []
+            for k, t in enumerate(through):
+                i, j = t["i"], t["j"]
+                if t["degenerate"]:
+                    continue    # both arms end at the same point; the road chain already passes through it
+                mids = [node for _t, node in sorted(t["inserts"], key=lambda it: it[0])]
+                a_info, b_info = info[i], info[j]
+                if a_info["one_way"]:
+                    flip = a_info["flow_in"] is False          # flow must run from the entering arm to the leaving one
+                else:
+                    chain_ij = int(a_info["into"]) + int(not b_info["into"])
+                    chain_ji = int(b_info["into"]) + int(not a_info["into"])
+                    flip = chain_ji > chain_ij
+                nodes = [a_info["end"]] + mids + [b_info["end"]]
+                if flip:
+                    a_info, b_info, nodes = b_info, a_info, nodes[::-1]
+                c0, c1 = a_info["c"], b_info["c"]
+                start_id = ((a_info["node"], a_info["raw_end"])
+                            if a_info["into"] and a_info["chain"] else (free_node(), -1))
+                end_id = ((b_info["node"], b_info["raw_start"])
+                          if not b_info["into"] and b_info["chain"] else (free_node(), -1))
+                lanes, one_way = flow_lanes(a_info)
+                new_roads.append(junction_road(c0, nodes, start_id, end_id, f"through{k}", lanes, one_way))
+                stats["through_roads"] += 1
+            for s, point in stems:
+                a_info = info[s]
+                c0 = a_info["c"]
+                lanes, one_way = flow_lanes(a_info)
+                entering = a_info["flow_in"] if a_info["one_way"] else a_info["into"]
+                if entering:
+                    start = ((a_info["node"], a_info["raw_end"])
+                             if a_info["into"] and a_info["chain"] else (free_node(), -1))
+                    new_roads.append(junction_road(c0, [a_info["end"], point], start, (free_node(), -1),
+                                                   f"stem{s}", lanes, one_way))
+                else:
+                    end = ((a_info["node"], a_info["raw_start"])
+                           if not a_info["into"] and a_info["chain"] else (free_node(), -1))
+                    new_roads.append(junction_road(c0, [point, a_info["end"]], (free_node(), -1), end,
+                                                   f"stem{s}", lanes, one_way))
+            added.extend(new_roads)
+            main_roads.extend(r["nodes"] for r in new_roads)
+            for c in decisions:
+                if inside(c, cluster_nodes) and int(c.get("source_type", -1)) in COMBINE_LANE_TYPES + (COMBINE_MEDIAN_TYPE,):
+                    consumed_ids.add(id(c))
+            stats["junctions_resolved"] += 1
+
+        # runoffs: every junction, resolved or not
+        runoff_arms = runoff_touching.get(root, [])
+        if runoff_arms and decisions:
+            for c in decisions:
+                if inside(c, cluster_nodes) and int(c.get("source_type", -1)) == RUNOFF_TYPE:
+                    consumed_ids.add(id(c))
+            limit = min(radius, 140.0)
+            pieces, unpaired = _extend_runoffs(root, runoff_arms, main_roads, sentinel, max_chord=limit, max_run=limit)
+            added.extend(pieces)
+            stats["runoff_pieces"] += len(pieces)
+            stats["runoff_ends_without_pair"] += unpaired
+
+    out = [c for c in corridors if id(c) not in consumed_ids] + added
+    stats["connectors_removed"] = len(consumed_ids)
+    stats["junction_roads_added"] = len(added)
+    stats["skipped_junctions"] = skipped
+    return out, stats
+
+
+def _extend_runoffs(root, runoff_arms, main_roads, sentinel, *, max_chord=140.0, max_run=60.0):
+    """Extend the ends of the runoff roads of one junction so that every end has a pair."""
+    arms = []
+    for c, n in runoff_arms:
+        into = _oriented_source_endpoints(c)[1] == n       # nodes are stored in travel order
+        nodes = [list(map(float, p)) for p in c["nodes"]]
+        toward = nodes if into else nodes[::-1]
+        end = toward[-1]
+        back = next((p for p in reversed(toward[:-1]) if math.hypot(p[0] - end[0], p[1] - end[1]) >= 3.0), toward[0])
+        dx, dy = end[0] - back[0], end[1] - back[1]
+        length = math.hypot(dx, dy) or 1.0
+        arms.append({"c": c, "end": end, "dir": (dx / length, dy / length)})
+    if not arms:
+        return [], 0
+    pieces, joined, chords = [], set(), []
+
+    def piece(src, nodes, suffix):
+        sentinel[0] += 2
+        road = dict(src)
+        road.update({
+            "id": f"junction_{root}_runoff_{suffix}", "source_key": f"junction:{root}:runoff:{suffix}",
+            "nodes": [[round(v, 4) for v in p] for p in nodes], "direction": "forward",
+            "node_start": -sentinel[0], "node_end": -sentinel[0] - 1,
+            "zone_raw_start": -1, "zone_raw_end": -1, "zone_index": -1,
+            "width_start": nodes[0][3], "width_end": nodes[-1][3],
+            "one_way": False, "lanes_left": 1, "lanes_right": 1, "auto_lanes": False,
+            "combined_junction": True, "runoff_extension": True, "override": {}, "export": True,
+        })
+        pieces.append(road)
+
+    # 1. opposite runoff ends that look at each other join
+    cands = []
+    for i in range(len(arms)):
+        for j in range(i + 1, len(arms)):
+            a, b = arms[i], arms[j]
+            ch = (b["end"][0] - a["end"][0], b["end"][1] - a["end"][1])
+            dist = math.hypot(*ch)
+            if dist < 1.0 or dist > max_chord:
+                continue
+            h = (ch[0] / dist, ch[1] / dist)
+            if a["dir"][0] * b["dir"][0] + a["dir"][1] * b["dir"][1] > -0.3:
+                continue
+            fa = a["dir"][0] * h[0] + a["dir"][1] * h[1]
+            fb = -(b["dir"][0] * h[0] + b["dir"][1] * h[1])
+            if fa < 0.2 or fb < 0.2:
+                continue
+            miss = abs(a["dir"][0] * h[1] - a["dir"][1] * h[0]) + abs(b["dir"][0] * h[1] - b["dir"][1] * h[0])
+            if miss < 1.3:
+                cands.append((miss, i, j))
+    for _miss, i, j in sorted(cands):
+        if i in joined or j in joined:
+            continue
+        joined |= {i, j}
+        piece(arms[i]["c"], [arms[i]["end"], arms[j]["end"]], f"pair{i}_{j}")
+        chords.append((arms[i]["end"], arms[j]["end"]))
+
+    # 2. remaining ends run on along their heading to a joined pair or the nearest road
+    for s in range(len(arms)):
+        if s in joined:
+            continue
+        a = arms[s]
+        far = (a["end"][0] + a["dir"][0] * max_run, a["end"][1] + a["dir"][1] * max_run)
+        best = None
+        polylines = [[p, q] for p, q in chords] + main_roads
+        for line in polylines:
+            for k in range(len(line) - 1):
+                hit = _seg_cross(a["end"], far, line[k], line[k + 1])
+                if hit and (best is None or hit[0] < best[0]):
+                    best = (hit[0], hit[1], line[k], line[k + 1])
+        if best:
+            _t, u, p, q = best
+            point = _lerp_node(p, q, u)
+            point[3] = a["end"][3]
+            piece(a["c"], [a["end"], point], f"run{s}")
+            joined.add(s)
+
+    # 3. an end without a pair joins the nearest other runoff end
+    unpaired = 0
+    for s in range(len(arms)):
+        if s in joined:
+            continue
+        a = arms[s]
+        others = [(math.hypot(b["end"][0] - a["end"][0], b["end"][1] - a["end"][1]), k)
+                  for k, b in enumerate(arms) if k != s and b["c"] is not a["c"]]
+        others = [o for o in others if 1.0 <= o[0] <= max_chord]
+        if others:
+            _d, k = min(others)
+            piece(a["c"], [a["end"], arms[k]["end"]], f"near{s}_{k}")
+            joined |= {s, k}
+        else:
+            unpaired += 1
+    return pieces, unpaired
+
+
+def scale_road_widths(roads, factor):
+    """Multiply every node width of every road by `factor` (a value near 1.0 makes all roads a bit narrower).
+
+    Used for the export so collision packs next to the roads do not break the DecalRoads.
+    Returns the roads unchanged for factor 1.0; otherwise copies with scaled nodes.
+    """
+    factor = float(factor)
+    if not (factor == factor and 0 < factor < float("inf")):
+        raise ValueError("width scale must be a positive finite number")
+    if factor == 1.0:
+        return roads
+    out = []
+    for road in roads:
+        scaled = dict(road)
+        scaled["nodes"] = [[*p[:3], round(p[3] * factor, 4)] for p in road.get("nodes") or []]
+        if scaled["nodes"]:
+            scaled["width_start"], scaled["width_end"] = scaled["nodes"][0][3], scaled["nodes"][-1][3]
+        out.append(scaled)
     return out
