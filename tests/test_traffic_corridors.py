@@ -6,9 +6,11 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from traffic_corridors import (build_corridors, merged_type_rules, get_oriented_zone,
+from traffic_corridors import (
+    build_corridors, merged_type_rules, get_oriented_zone,
                                 merge_connected_corridors, harmonize_zone_endpoints, combine_carriageways,
-                                thin_nodes, thin_roads, resolve_junctions, scale_road_widths,
+                                thin_nodes, thin_roads, resolve_junctions, scale_road_widths, keep_shoulders_near_shortcuts, preserve_winding,
+                                _corridor_merge_signature,
                                 FLAG_START_INVERTED, FLAG_DECISION, FLAG_NO_TRAFFIC)
 from traffic_node_exporter import write_items_level, write_source_manifest
 
@@ -120,6 +122,21 @@ class CombineCarriagewayTests(unittest.TestCase):
         road = [c for c in out if c.get("combined")][0]
         self.assertEqual((road["lanes_left"], road["lanes_right"]), (2, 2))
         self.assertEqual(sorted(c["source_type"] for c in out if not c.get("combined")), [3, 3, 3])
+
+    def test_decision_connector_lanes_become_one_road_only_when_asked(self):
+        net = make_network_with([3, 1, 1, 4, 1, 1, 3], [4] * 7, [12, 8, 4, 0, 4, 8, 12], 3, flags=FLAG_DECISION)
+        out, report = combine_carriageways(export_input(net, include_decision_connectors=True))
+        self.assertFalse(any(c.get("combined") for c in out))                    # default: one road per lane
+        self.assertEqual(report["skipped_segments"], {"decision or NoTraffic segment": 1})
+        out, report = combine_carriageways(export_input(net, include_decision_connectors=True), combine_connectors=True)
+        road = [c for c in out if c.get("combined")]
+        self.assertEqual(len(road), 1)
+        self.assertEqual((road[0]["lanes_left"], road[0]["lanes_right"]), (2, 2))
+        self.assertTrue(road[0]["source_decision"])                              # still a connector for the junction logic
+        self.assertEqual(report["median_corridors_dropped"], 1)
+        out, report = combine_carriageways(
+            export_input(make_network_with(*self.FIVE, flags=FLAG_NO_TRAFFIC), include_decision_connectors=True), combine_connectors=True)
+        self.assertEqual(report["combined_segments"], 0)                          # NoTraffic is never combined
 
     def test_no_traffic_segment_is_not_combined(self):
         from traffic_corridors import FLAG_NO_TRAFFIC
@@ -322,6 +339,26 @@ class JunctionRoadTests(unittest.TestCase):
         self.assertEqual(sum(1 for c in out if c.get("runoff_extension")), 0)       # 20 m is beyond the radius
         self.assertEqual(report["runoff_ends_without_pair"], 2)
 
+    def test_unresolved_junction_runoff_runs_onto_the_arm_next_to_it(self):
+        junction = self._t_junction()
+        run = dict(source_type=3, combined=False, one_way=True, lanes_left=0, lanes_right=1)
+        junction.append(_arm("run_s", 23, 12, [(12, -60), (12, -30), (12, -6)], raw=1, segment_index=103, **run))
+        out, report = resolve_junctions(junction, connect_radius=8)           # too big for the radius: connectors stay
+        self.assertEqual(report["junctions_resolved"], 0)
+        pieces = [c for c in out if c.get("runoff_extension")]
+        self.assertEqual(len(pieces), 1)
+        self.assertEqual(report["runoff_ends_without_pair"], 0)
+        self.assertEqual([round(v, 3) for v in pieces[0]["nodes"][-1][:2]], [12.0, 0.0])   # on the east arm
+
+    def test_median_connector_is_dropped_in_an_unresolved_junction_too(self):
+        junction = self._t_junction()
+        junction.append(_arm("gap", 10, 12, [(0, 0), (1, 1)], road_id=-1, source_decision=True, combined=False,
+                             source_type=4, one_way=True, lanes_left=0, lanes_right=1))
+        out, report = resolve_junctions(junction, connect_radius=8)
+        self.assertEqual(report["junctions_resolved"], 0)
+        self.assertNotIn("gap", [c["id"] for c in out])
+        self.assertEqual(sum(1 for c in out if c.get("source_decision")), 4)         # traffic and walk connectors stay
+
     def test_width_tolerance_keeps_small_width_wobbles_out(self):
         line = [[0.0, 3.0 * i, 0.0, 16.0 + (0.8 if i == 5 else 0.0)] for i in range(11)]
         self.assertGreater(len(thin_nodes(line, 0.3, 0.0)), 2)                      # 0.4 m half-difference > 0.3 m
@@ -359,6 +396,85 @@ class JunctionRoadTests(unittest.TestCase):
         out, report = resolve_junctions(junction)
         self.assertEqual(len(out), len(junction))
         self.assertEqual(report["skipped_junctions"], {"an arm is not a combined road": 1})
+
+
+def _road(name, source_type, points, width=3.0):
+    return {"id": name, "source_type": source_type, "nodes": [[x, y, 0.0, width] for x, y in points]}
+
+
+class ShouldersConnectShortcutsTests(unittest.TestCase):
+    def test_shoulder_is_kept_where_it_connects_a_shortcut_to_a_main_road(self):
+        roads = [_road("cut", 10, [(40, 0), (60, 0)]),
+                 _road("main", 1, [(-300, 4), (300, 4)], width=8.0),
+                 _road("shoulder", 3, [(-200, 3), (0, 3), (100, 3), (300, 3)], width=2.0)]
+        out, report = keep_shoulders_near_shortcuts(roads, extend=10.0)
+        by_id = {r["id"]: r for r in out}
+        self.assertIn("main", by_id)                                              # other roads are untouched
+        piece = by_id["shoulder_near0"]
+        xs = [n[0] for n in piece["nodes"]]
+        self.assertTrue(26 < min(xs) < 34 and 66 < max(xs) < 74)                  # shortcut contact 40..60 plus 10 m each side
+        self.assertEqual((report["trimmed"], report["dropped"], report["kept_whole"]), (1, 0, 0))
+
+    def test_shoulder_that_never_reaches_a_main_road_or_a_shortcut_is_dropped(self):
+        roads = [_road("cut", 10, [(0, 0), (100, 0)]),
+                 _road("lonely", 3, [(0, 2), (100, 2)], width=2.0),          # touches the shortcut, no main road anywhere
+                 _road("far", 3, [(0, 500), (100, 500)], width=2.0),
+                 _road("main", 1, [(0, 600), (100, 600)], width=8.0)]
+        out, report = keep_shoulders_near_shortcuts(roads)
+        self.assertEqual(sorted(r["id"] for r in out), ["cut", "main"])
+        self.assertEqual(report["dropped"], 2)
+
+    def test_a_long_contact_stays_whole_and_sidewalks_count_as_shoulders(self):
+        roads = [_road("cut", 10, [(0, 0), (100, 0)]), _road("main", 1, [(0, 4), (100, 4)], width=8.0),
+                 _road("walk", 2, [(10, 2), (90, 2)], width=2.0)]
+        out, report = keep_shoulders_near_shortcuts(roads)
+        self.assertIs([r for r in out if r["id"] == "walk"][0], roads[2])
+        self.assertEqual(report["kept_whole"], 1)
+
+    def test_contact_is_judged_on_the_scaled_widths(self):
+        roads = [_road("cut", 10, [(0, 0), (100, 0)], width=4.0), _road("main", 1, [(0, 3), (100, 3)], width=8.0),
+                 _road("walk", 2, [(0, 5), (100, 5)], width=4.0)]
+        self.assertEqual(keep_shoulders_near_shortcuts(roads)[1]["dropped"], 0)                    # 2 + 2 + 1.5 reaches the 5 m gap
+        self.assertEqual(keep_shoulders_near_shortcuts(roads, width_scale=0.5)[1]["dropped"], 1)   # narrower roads no longer touch
+
+    def test_two_shortcuts_give_two_pieces(self):
+        roads = [_road("a", 10, [(0, 0), (10, 0)]), _road("b", 10, [(400, 0), (410, 0)]),
+                 _road("main", 1, [(-100, 4), (600, 4)], width=8.0), _road("walk", 2, [(-100, 2), (500, 2)], width=2.0)]
+        out, report = keep_shoulders_near_shortcuts(roads, extend=6.0)
+        self.assertEqual([r["id"] for r in out if r["id"].startswith("walk")], ["walk_near0", "walk_near1"])
+
+
+class MergeSignatureRoleTests(unittest.TestCase):
+    def test_shoulder_median_and_lane_never_share_a_chain_even_with_the_same_drivability(self):
+        def sig(source_type):
+            return _corridor_merge_signature({"source_type": source_type, "drivability": 1.0, "one_way": True,
+                                              "lanes_left": 0, "lanes_right": 1})
+        self.assertNotEqual(sig(3), sig(1))
+        self.assertNotEqual(sig(3), sig(10))
+        self.assertNotEqual(sig(4), sig(1))
+        self.assertEqual(sig(2), sig(3))                 # sidewalk and shoulder are the same role
+        self.assertEqual(sig(1), sig(10))                # traffic and general road may still continue into each other
+
+
+class PreserveWindingTests(unittest.TestCase):
+    def test_reverse_lane_goes_back_to_source_winding_with_lanes_left(self):
+        road = {"id": "r", "direction": "reverse", "one_way": True, "lanes_left": 0, "lanes_right": 1,
+                "nodes": [[30, 0, 0, 4], [15, 0, 0, 5], [0, 0, 0, 6]], "width_start": 4, "width_end": 6}
+        out, count = preserve_winding([road])
+        self.assertEqual(count, 1)
+        fixed = out[0]
+        self.assertEqual([n[0] for n in fixed["nodes"]], [0, 15, 30])
+        self.assertEqual((fixed["lanes_left"], fixed["lanes_right"], fixed["direction"]), (1, 0, "forward"))
+        self.assertEqual((fixed["width_start"], fixed["width_end"]), (6, 4))
+        self.assertEqual(road["nodes"][0][0], 30)                       # the input is not modified
+
+    def test_forward_two_way_and_combined_roads_are_left_alone(self):
+        roads = [{"id": "a", "direction": "forward", "one_way": True, "lanes_left": 0, "lanes_right": 1, "nodes": [[0, 0, 0, 4], [9, 0, 0, 4]]},
+                 {"id": "b", "direction": "reverse", "one_way": False, "lanes_left": 1, "lanes_right": 1, "nodes": [[0, 0, 0, 4], [9, 0, 0, 4]]},
+                 {"id": "c", "direction": "forward", "one_way": True, "lanes_left": 2, "lanes_right": 0, "nodes": [[0, 0, 0, 8], [9, 0, 0, 8]]}]
+        out, count = preserve_winding(roads)
+        self.assertEqual(count, 0)
+        self.assertEqual(out, roads)
 
 
 class TrafficCorridorTests(unittest.TestCase):

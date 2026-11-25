@@ -410,11 +410,22 @@ def build_corridors(network, type_rules=None, overrides=None, *, patterns=None, 
 
 
 
+def _zone_role(corridor):
+    """Coarse role of a source zone: shoulder/sidewalk, median or lane (traffic, general road, ...).
+
+    A shoulder or median never continues as a lane (and the other way round), however the drivability rules
+    are set: with the same drivability for every type they would otherwise merge into one chain that carries
+    the type of its first piece.
+    """
+    source_type = int(corridor.get("source_type", -1))
+    return "shoulder" if source_type in (2, 3) else "median" if source_type == 4 else "lane"
+
+
 def _corridor_merge_signature(corridor):
     """BeamNG road-level fields that must remain constant over a road chain.
 
     Classification names and zone indices are not in this signature: they can
-    change at profile transitions. Width is node-local in DecalRoad, so differing
+    change at profile transitions (traffic <-> general road); the zone role is. Width is node-local in DecalRoad, so differing
     widths must not force a split. Actual source zone identity is checked at each
     shared endpoint by merge_connected_corridors().
     """
@@ -426,6 +437,7 @@ def _corridor_merge_signature(corridor):
         int(corridor.get("lanes_left", 0)),
         int(corridor.get("lanes_right", 1)),
         bool(corridor.get("over_objects", False)),
+        _zone_role(corridor),
     )
 
 
@@ -671,7 +683,7 @@ def _forward_nodes(corridor):
     return nodes[::-1] if corridor.get("direction") == "reverse" else nodes
 
 
-def combine_carriageways(corridors):
+def combine_carriageways(corridors, combine_connectors=False):
     """Replace the lanes of a segment that flow the same way by ONE DecalRoad.
 
     Per segment, the traffic lanes (types 1 and 10) become one road. The nodes sit on the
@@ -684,13 +696,18 @@ def combine_carriageways(corridors):
       also when the sides are uneven (4 left, 2 right);
     * one-sided segment (flagged one-way, or all lanes on one side): one_way True and every
       lane on one road, lanes_right = n when the traffic flows along the nodes, lanes_left = n
-      when it flows against them; the node order is never reversed.
+      when it flows against them; the node order is never reversed (winding kept);
 
     Sidewalks, shoulders and every other zone stay separate roads exactly as before. A segment
     keeps the one-lane-per-road export when it is a decision connector or NoTraffic, a lane
     has an override, or the lanes differ in node count. A segment with a single lane is
     already one road. Works on the corridors after harmonize_zone_endpoints() and returns
     (corridors_for_export, report). The input corridors are not modified.
+
+    combine_connectors=True also combines the lanes of a Decision connector segment into ONE
+    road (a junction connector or ramp piece that carries several lanes), so a connector that
+    stays in the export looks like its neighbouring roads instead of one road per lane.
+    NoTraffic segments are never combined.
     """
     by_segment = {}
     for c in corridors:
@@ -710,8 +727,8 @@ def combine_carriageways(corridors):
         if len(lanes) < 2:
             continue   # one lane is already one road
         flags = int(group[0].get("segment_flags", 0))
-        if flags & (FLAG_DECISION | FLAG_NO_TRAFFIC):
-            skip("decision or NoTraffic segment")
+        if flags & (FLAG_NO_TRAFFIC if combine_connectors else (FLAG_DECISION | FLAG_NO_TRAFFIC)):
+            skip("NoTraffic segment" if combine_connectors else "decision or NoTraffic segment")
             continue
         if any(c.get("override") for c in lanes):
             skip("lane has a pattern or local override")
@@ -735,7 +752,8 @@ def combine_carriageways(corridors):
 
         one_sided = bool(flags & FLAG_ONE_WAY) or not left or not right
         if one_sided:
-            # all lanes flow the same way; lanes_left = traffic against the node order
+            # all lanes flow the same way; lanes_left = traffic against the node order. The winding of the
+            # source segment is kept (node order never reversed): BeamNG treats lanesLeft/lanesRight natively.
             against = bool(not (flags & FLAG_ONE_WAY) and left and not right)
             lanes_left, lanes_right, one_way = (len(lanes), 0, True) if against else (0, len(lanes), True)
             anchor = min(lanes, key=lambda c: abs(c["offset_start"]))
@@ -755,10 +773,18 @@ def combine_carriageways(corridors):
             edge_max = max(off + w * 0.5 for (off, w), _p in info)
             (off_a, _wa), pa = min(info, key=lambda it: it[0][0])
             (off_b, _wb), pb = max(info, key=lambda it: it[0][0])
+            centre = (edge_min + edge_max) * 0.5
             if off_b - off_a < 1e-6:
+                if combine_connectors and i in (0, count - 1):
+                    # a connector whose lanes meet in one point at an end: the road ends on that point
+                    nodes.append([round(sum(p[k] for _l, p in info) / len(info), 4) for k in range(3)]
+                                 + [round(max(0.05, edge_max - edge_min), 4)])
+                    if i == 0:
+                        off_first = centre
+                    off_last = centre
+                    continue
                 ok = False
                 break
-            centre = (edge_min + edge_max) * 0.5
             f = (centre - off_a) / (off_b - off_a)
             nodes.append([round(pa[k] + (pb[k] - pa[k]) * f, 4) for k in range(3)]
                          + [round(max(0.05, edge_max - edge_min), 4)])
@@ -854,6 +880,154 @@ def thin_nodes(nodes, tolerance=0.15, max_spacing=25.0, width_tolerance=None):
     return [nodes[k] for k in sorted(keep)]
 
 
+SHORTCUT_TYPE = 10            # General road zones: shortcuts and cut-throughs
+MAIN_ROAD_TYPE = 1            # traffic lanes
+SHOULDER_TYPES = (2, 3)       # sidewalk and shoulder zones
+
+
+def keep_shoulders_near_shortcuts(roads, extend=12.0, contact_tolerance=1.5, sample=2.0, width_scale=1.0):
+    """Keep shoulder/sidewalk roads only where they CONNECT a shortcut to a main road.
+
+    A shoulder or sidewalk (zone type 2 or 3) is kept where its width touches a shortcut (General road,
+    source_type 10) and only if it also touches a main road (traffic lanes, source_type 1). It is not a
+    distance rule: a shoulder that merely runs past a shortcut without reaching a main road goes, and
+    the part that touches the shortcut stays however long that contact is. The kept stretch is extended
+    by `extend` metres at both ends (not past the road's own ends) so the road overlaps its neighbours and
+    BeamNG's autoJunction can join them. Everything else on the shoulder is cut away. `width_scale` is the
+    global node width scale applied to the roads later, so the contact is judged on the widths that are exported.
+
+    Works on the merged export roads (before thinning). A road that connects along its whole length stays
+    untouched, otherwise each stretch becomes its own road (id suffix `_near<n>`) with new interpolated end
+    nodes. Returns (roads, report).
+    """
+    cell = 60.0
+
+    def add_points(grid, nodes):
+        for a, b in zip(nodes[:-1], nodes[1:]):
+            length = math.hypot(b[0] - a[0], b[1] - a[1])
+            steps = max(1, int(length / 1.5))
+            for k in range(steps + 1):
+                t = k / steps
+                x, y = a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t
+                grid.setdefault((int(x // cell), int(y // cell)), []).append((x, y, (a[3] + (b[3] - a[3]) * t) * 0.5 * width_scale))
+
+    shortcut_grid, main_grid = {}, {}
+    shortcuts = mains = 0
+    for road in roads:
+        st = int(road.get("source_type", -1))
+        nodes = road.get("nodes") or []
+        if len(nodes) < 2:
+            continue
+        if st == SHORTCUT_TYPE:
+            shortcuts += 1
+            add_points(shortcut_grid, nodes)
+        elif st == MAIN_ROAD_TYPE:
+            mains += 1
+            add_points(main_grid, nodes)
+
+    def touches(grid, x, y, half_width):
+        cx, cy = int(x // cell), int(y // cell)
+        for gx in (cx - 1, cx, cx + 1):
+            for gy in (cy - 1, cy, cy + 1):
+                for px, py, hw in grid.get((gx, gy), ()):
+                    reach = hw + half_width + contact_tolerance
+                    if (px - x) ** 2 + (py - y) ** 2 <= reach * reach:
+                        return True
+        return False
+
+    def run_length(points):
+        return sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(points[:-1], points[1:]))
+
+    out = []
+    report = {"shortcut_roads": shortcuts, "shoulder_roads": 0, "kept_whole": 0, "trimmed": 0, "dropped": 0,
+              "shoulder_km_before": 0.0, "shoulder_km_after": 0.0}
+    for road in roads:
+        nodes = road.get("nodes") or []
+        if int(road.get("source_type", -1)) not in SHOULDER_TYPES or len(nodes) < 2:
+            out.append(road)
+            continue
+        report["shoulder_roads"] += 1
+        report["shoulder_km_before"] += run_length(nodes) / 1000.0
+        points = [list(nodes[0])]
+        for a, b in zip(nodes[:-1], nodes[1:]):
+            length = math.hypot(b[0] - a[0], b[1] - a[1])
+            steps = max(1, int(length / sample))
+            for k in range(1, steps + 1):
+                t = k / steps
+                points.append([a[i] + (b[i] - a[i]) * t for i in range(len(a))] if k < steps else list(b))
+        on_shortcut = [touches(shortcut_grid, p[0], p[1], p[3] * 0.5 * width_scale) for p in points]
+        if not any(on_shortcut) or not any(touches(main_grid, p[0], p[1], p[3] * 0.5 * width_scale) for p in points):
+            report["dropped"] += 1                     # nothing to connect: no shortcut, or no main road next to it
+            continue
+        # contact stretches, then extended by `extend` metres along the road
+        keep = [False] * len(points)
+        reach_pts = max(1, int(round(extend / sample)))
+        for i, f in enumerate(on_shortcut):
+            if f:
+                for j in range(max(0, i - reach_pts), min(len(points), i + reach_pts + 1)):
+                    keep[j] = True
+        # the stretch must itself touch a main road, otherwise it does not connect the shortcut to anything
+        runs, current = [], []
+        for p, f in zip(points, keep):
+            if f:
+                current.append(p)
+            else:
+                if len(current) >= 2:
+                    runs.append(current)
+                current = []
+        if len(current) >= 2:
+            runs.append(current)
+        runs = [r for r in runs if any(touches(main_grid, p[0], p[1], p[3] * 0.5 * width_scale) for p in r)]
+        if not runs:
+            report["dropped"] += 1
+            continue
+        if len(runs) == 1 and len(runs[0]) == len(points):
+            out.append(road)
+            report["kept_whole"] += 1
+            report["shoulder_km_after"] += run_length(nodes) / 1000.0
+            continue
+        report["trimmed"] += 1
+        for n, run in enumerate(runs):
+            piece = dict(road)
+            piece["nodes"] = [[round(v, 4) for v in p] for p in run]
+            piece["id"] = f"{road.get('id', 'shoulder')}_near{n}"
+            out.append(piece)
+            report["shoulder_km_after"] += run_length(run) / 1000.0
+    report["shoulder_km_before"] = round(report["shoulder_km_before"], 1)
+    report["shoulder_km_after"] = round(report["shoulder_km_after"], 1)
+    return out, report
+
+
+def preserve_winding(roads):
+    """Give every one-lane road whose traffic runs against the source winding BeamNG's native form.
+
+    The lane zones on the left of a source segment drive against the segment order. build_corridors()
+    stores those lanes in travel order (nodes reversed) with lanes_right = n, so the node winding no
+    longer matches the source and BeamNG's autoJunction treats the road like a NoTraffic piece at
+    merges and Y junctions. Here such a road gets its nodes back in the source winding and the lane
+    count moves to lanes_left (blue lanes in the road editor): same traffic, native mapping.
+
+    Works on the final roads (after merging and thinning) and returns (roads, count). Two-way roads,
+    combined carriageways and junction roads already follow the winding and are left alone.
+    """
+    out, flipped = [], 0
+    for road in roads:
+        if (road.get("direction") == "reverse" and road.get("one_way", True)
+                and int(road.get("lanes_left", 0)) == 0 and len(road.get("nodes") or []) >= 2):
+            road = dict(road)
+            road["nodes"] = [list(n) for n in road["nodes"][::-1]]
+            road["lanes_left"], road["lanes_right"] = int(road.get("lanes_right", 1)), 0
+            road["direction"] = "forward"
+            road["winding_preserved"] = True
+            for a, b in (("width_start", "width_end"), ("offset_start", "offset_end"),
+                         ("node_start", "node_end"), ("zone_raw_start", "zone_raw_end")):
+                if a in road and b in road:
+                    road[a], road[b] = road[b], road[a]
+            flipped += 1
+        out.append(road)
+    return out, flipped
+
+
 def thin_roads(roads, tolerance=0.15, max_spacing=25.0, width_tolerance=None):
     """thin_nodes() for every merged road. Returns (roads, {"nodes_before", "nodes_after"})."""
     before = after = 0
@@ -896,6 +1070,7 @@ def _lerp_node(a, b, t):
     return [round(a[k] + (b[k] - a[k]) * t, 4) for k in range(4)]
 
 
+INTERCHANGE_RUNOFF_REACH = 140.0   # metres a runoff end may reach in a junction that keeps its connectors
 RUNOFF_TYPE = 3   # sidewalk / shoulder lanes: their own roads, extended at junctions
 
 
@@ -1170,11 +1345,24 @@ def resolve_junctions(corridors, *, min_opposite_dot=-0.3, connect_radius=50.0):
 
         # runoffs: every junction, resolved or not
         runoff_arms = runoff_touching.get(root, [])
+        if runoff_arms and decisions and not resolved:
+            # The junction keeps its own connectors: its arms and its (combined) connector roads
+            # are what the runoff ends run on to, so they pair with the road next to them.
+            main_roads = [[list(map(float, p)) for p in c["nodes"]] for c, _n in arms]
+            main_roads += [[list(map(float, p)) for p in c["nodes"]] for c in decisions
+                           if inside(c, cluster_nodes) and len(c.get("nodes") or []) >= 2
+                           and int(c.get("source_type", -1)) in COMBINE_LANE_TYPES]
+        for c in decisions:
+            # a median connector carries no traffic: it is a dead gap, also in a junction that keeps its connectors
+            if inside(c, cluster_nodes) and int(c.get("source_type", -1)) == COMBINE_MEDIAN_TYPE:
+                consumed_ids.add(id(c))
         if runoff_arms and decisions:
             for c in decisions:
                 if inside(c, cluster_nodes) and int(c.get("source_type", -1)) == RUNOFF_TYPE:
                     consumed_ids.add(id(c))
-            limit = min(radius, 140.0)
+            # A junction that keeps its connectors is a big interchange: its shoulder/sidewalk ends may
+            # reach their pair across the whole interchange instead of stopping at the connection radius.
+            limit = min(radius, 140.0) if resolved else INTERCHANGE_RUNOFF_REACH
             pieces, unpaired = _extend_runoffs(root, runoff_arms, main_roads, sentinel, max_chord=limit, max_run=limit)
             added.extend(pieces)
             stats["runoff_pieces"] += len(pieces)
