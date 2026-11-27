@@ -998,6 +998,418 @@ def keep_shoulders_near_shortcuts(roads, extend=12.0, contact_tolerance=1.5, sam
     return out, report
 
 
+def drop_shoulders(corridors):
+    """Leave sidewalk and shoulder zones (types 2 and 3) out of the export altogether.
+
+    Works on the zone corridors before they are combined, so their connectors, junction runoffs and
+    shoulder/sidewalk chains never exist. Returns (corridors, number dropped). The input is not modified.
+    """
+    kept = [c for c in corridors if int(c.get("source_type", -1)) not in SHOULDER_TYPES]
+    return kept, len(corridors) - len(kept)
+
+
+def _unit(dx, dy):
+    length = math.hypot(dx, dy)
+    return (dx / length, dy / length) if length > 1e-9 else (0.0, 0.0)
+
+
+def _hermite(p0, t0, p1, t1, spacing=2.0):
+    """Cubic Hermite curve from p0 (leaving along unit t0) to p1 (arriving along unit t1), nodes ~`spacing` m apart.
+
+    Returns the nodes after p0 up to and including p1 as [x, y, z, width]; z and width are interpolated linearly.
+    """
+    chord = math.hypot(p1[0] - p0[0], p1[1] - p0[1])
+    steps = max(1, int(math.ceil(chord / spacing)))
+    m0 = (t0[0] * chord, t0[1] * chord)
+    m1 = (t1[0] * chord, t1[1] * chord)
+    out = []
+    for i in range(1, steps + 1):
+        u = i / steps
+        h00, h10, h01, h11 = 2 * u ** 3 - 3 * u ** 2 + 1, u ** 3 - 2 * u ** 2 + u, -2 * u ** 3 + 3 * u ** 2, u ** 3 - u ** 2
+        out.append([round(h00 * p0[0] + h10 * m0[0] + h01 * p1[0] + h11 * m1[0], 4),
+                    round(h00 * p0[1] + h10 * m0[1] + h01 * p1[1] + h11 * m1[1], 4),
+                    round(p0[2] + (p1[2] - p0[2]) * u, 4), round(p0[3] + (p1[3] - p0[3]) * u, 4)])
+    return out
+
+
+def _max_turn(nodes):
+    """Largest change of direction (degrees) at any node of a polyline."""
+    worst = 0.0
+    for a, b, c in zip(nodes[:-2], nodes[1:-1], nodes[2:]):
+        u, v = _unit(b[0] - a[0], b[1] - a[1]), _unit(c[0] - b[0], c[1] - b[1])
+        if u == (0.0, 0.0) or v == (0.0, 0.0):
+            continue
+        worst = max(worst, math.degrees(math.acos(max(-1.0, min(1.0, u[0] * v[0] + u[1] * v[1])))))
+    return worst
+
+
+def _unhook(path, max_deviation=60.0, min_length=6.0, spacing=2.0):
+    """The part of a connector path before it hooks back: it ends where the direction first turns more than
+    `max_deviation` degrees away from the way the path set off.
+
+    Returns the resampled nodes up to that point, or None when the path never hooks or the part before the hook
+    is shorter than `min_length` metres.
+    """
+    dense = [list(map(float, path[0]))]
+    for a, b in zip(path[:-1], path[1:]):
+        steps = max(1, int(math.ceil(math.hypot(b[0] - a[0], b[1] - a[1]) / spacing)))
+        for i in range(1, steps + 1):
+            dense.append([a[k] + (b[k] - a[k]) * (i / steps) for k in range(4)])
+    if len(dense) < 4:
+        return None
+    first = _unit(dense[3][0] - dense[0][0], dense[3][1] - dense[0][1])
+    length = 0.0
+    for i in range(1, len(dense)):
+        length += math.hypot(dense[i][0] - dense[i - 1][0], dense[i][1] - dense[i - 1][1])
+        here = _unit(dense[min(i + 2, len(dense) - 1)][0] - dense[max(i - 2, 0)][0],
+                     dense[min(i + 2, len(dense) - 1)][1] - dense[max(i - 2, 0)][1])
+        if here[0] * first[0] + here[1] * first[1] < math.cos(math.radians(max_deviation)):
+            return dense[:i - 1] if length - spacing >= min_length and i - 1 >= 3 else None
+    return None
+
+
+def _guided_path(connector, start, start_heading, finish, spacing=2.0, arrive=None):
+    """A guide connector joined to `start` and `finish` by smooth curves instead of jumps.
+
+    The connector (nodes [x, y, z, width], from the road end side to the traffic road side) is resampled to
+    ~`spacing` metres. A Hermite curve leads from `start`, leaving along `start_heading`, onto the connector a
+    little way in (twice the sideways gap, at least 6 m), and another leads off it onto `finish`, arriving along
+    the connector's own final direction (2.5 x the gap, at least 8 m before its end); never more than 45% of
+    the connector each, so the guide's own curve stays in between. `arrive` (unit vector) replaces the connector's
+    own final direction as the direction of arrival at `finish`. Returns the nodes from `start` to `finish`.
+    """
+    dense = [list(map(float, connector[0]))]
+    for a, b in zip(connector[:-1], connector[1:]):
+        steps = max(1, int(math.ceil(math.hypot(b[0] - a[0], b[1] - a[1]) / spacing)))
+        for i in range(1, steps + 1):
+            dense.append([a[k] + (b[k] - a[k]) * (i / steps) for k in range(4)])
+    arc = [0.0]
+    for q0, q1 in zip(dense[:-1], dense[1:]):
+        arc.append(arc[-1] + math.hypot(q1[0] - q0[0], q1[1] - q0[1]))
+    total = arc[-1]
+    join = min(max(6.0, 2.0 * math.hypot(start[0] - dense[0][0], start[1] - dense[0][1])), 0.45 * total)
+    leave = min(max(8.0, 2.5 * math.hypot(finish[0] - dense[-1][0], finish[1] - dense[-1][1])), 0.45 * total)
+    j = next(i for i, a in enumerate(arc) if a >= join)
+    k = max(j, max(i for i, a in enumerate(arc) if a <= total - leave))
+
+    def tangent(i):
+        return _unit(dense[min(i + 2, len(dense) - 1)][0] - dense[max(i - 2, 0)][0],
+                     dense[min(i + 2, len(dense) - 1)][1] - dense[max(i - 2, 0)][1])
+
+    first = [round(v, 4) for v in start[:3]] + [dense[0][3]]
+    last = [round(v, 4) for v in finish[:3]] + [dense[-1][3]]
+    path = [first] + _hermite(first, start_heading, dense[j], tangent(j), spacing)
+    path += [[round(v, 4) for v in q[:3]] + [q[3]] for q in dense[j + 1:k + 1]]
+    path += _hermite(dense[k], tangent(k), last, arrive or tangent(len(dense) - 1), spacing)
+    return path
+
+
+def shoulder_guides(corridors):
+    """Sidewalk and shoulder Decision connectors (types 2 and 3), the smooth source curves that join a road end to a traffic road.
+
+    They are never exported; extend_general_roads() reads their paths. A connector runs from node_start to
+    node_end and carries its own curved nodes. Returns copies, the input is not modified.
+    """
+    return [dict(c) for c in corridors
+            if int(c.get("source_type", -1)) in SHOULDER_TYPES and c.get("source_decision")
+            and len(c.get("nodes") or []) >= 2]
+
+
+def extend_general_roads(roads, overlap=2.0, max_reach=0.0, width_scale=1.0, touch_tolerance=0.5,
+                         unlimited_reach=300.0, cell=60.0, guides=None, guide_factor=3.0, guide_extra=30.0, guide_max_turn=30.0):
+    """Extend every free end of a General road (source_type 10) to the nearest traffic road.
+
+    A General road end that already touches a traffic road (or another General road) is left alone.
+    Any other end runs on along its own heading to the first traffic road it hits; when the heading
+    misses (nothing within 1.6 x the distance to the nearest road, at least 15 m more), it goes straight
+    to the nearest point of the nearest traffic road. The extension ends `overlap` metres past that road's
+    middle so the two roads overlap and BeamNG's autoJunction joins them. Each extension is its own road
+    (id suffix `_ext0` at the start, `_ext1` at the end) with the General road's lanes and flow, its width
+    tapering from the road's end width to the traffic road's width (never wider than the road), nodes in the
+    same winding as the road it continues. `max_reach` (metres, 0 = unlimited) is the longest
+    extension; unlimited means `unlimited_reach`. `width_scale` is the global node width scale applied
+    later, so contacts are judged on the widths that are exported.
+
+    guides (shoulder_guides() connectors, optional): a free end that has a sidewalk or shoulder Decision
+    connector on its own source node follows that connector's curve to the node at its other end, when that
+    end lies on or within 3 m of a traffic road; the curve is the source's own path between the two roads and
+    does not cut across barriers or objects. Among several connectors (a road has one per zone) the one
+    ending closest to the traffic road wins, then the shortest. The extension then ends on the traffic road's
+    middle and `overlap` past it like the straight one. A connector longer than `guide_factor` x the straight
+    distance + `guide_extra` metres is not used (it would run alongside the road instead of joining it), and
+    neither is one whose finished path turns more than `guide_max_turn` degrees at any node (no wrinkles).
+    The extension always goes the same way as the road: a connector that sets off or arrives against the
+    road's heading (a U-turn hook back onto the traffic road) is not followed round the hook: another connector
+    is tried, else only the part before the hook is followed and the extension leaves it there, going straight
+    into the traffic road ahead with the overlap, so autoJunction joins it (a shortcut that runs both ways).
+    Without such a connector the straight extension is used.
+
+    Works on the merged export roads (before thinning). Returns (roads, report); the input is not modified.
+    """
+    reach = float(max_reach) if max_reach and max_reach > 0 else float(unlimited_reach)
+    segs, seg_grid = [], {}
+    general_pts = {}
+    general = []
+    for index, road in enumerate(roads):
+        nodes = road.get("nodes") or []
+        st = int(road.get("source_type", -1))
+        if len(nodes) < 2:
+            continue
+        if st == MAIN_ROAD_TYPE:
+            for a, b in zip(nodes[:-1], nodes[1:]):
+                k = len(segs)
+                segs.append((a, b))
+                for gx in range(int(min(a[0], b[0]) // cell), int(max(a[0], b[0]) // cell) + 1):
+                    for gy in range(int(min(a[1], b[1]) // cell), int(max(a[1], b[1]) // cell) + 1):
+                        seg_grid.setdefault((gx, gy), []).append(k)
+        elif st == SHORTCUT_TYPE:
+            general.append(index)
+            for a, b in zip(nodes[:-1], nodes[1:]):
+                length = math.hypot(b[0] - a[0], b[1] - a[1])
+                steps = max(1, int(length / 1.5))
+                for k in range(steps + 1):
+                    t = k / steps
+                    x, y = a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t
+                    general_pts.setdefault((int(x // cell), int(y // cell)), []).append(
+                        (index, x, y, (a[3] + (b[3] - a[3]) * t) * 0.5 * width_scale))
+
+    by_node = {}
+    for g in (guides or []):
+        for node_id in {g.get("node_start"), g.get("node_end")}:
+            if node_id is not None:
+                by_node.setdefault(node_id, []).append(g)
+
+    def nearest_traffic(x, y):
+        """(distance, segment index, parameter) of the closest traffic road within reach."""
+        best = None
+        cx, cy = int(x // cell), int(y // cell)
+        ring = 0
+        while True:
+            for gx in range(cx - ring, cx + ring + 1):
+                for gy in range(cy - ring, cy + ring + 1):
+                    if max(abs(gx - cx), abs(gy - cy)) != ring:
+                        continue
+                    for k in seg_grid.get((gx, gy), ()):
+                        a, b = segs[k]
+                        t, d = _seg_param((x, y), a, b)
+                        if best is None or d < best[0]:
+                            best = (d, k, t)
+            if (best is not None and best[0] <= ring * cell) or ring * cell > reach:
+                return best if best is not None and best[0] <= reach else None
+            ring += 1
+
+    def touching_road(x, y, half_width, skip_index):
+        """True when (x, y) lies on a traffic road or on another General road, widths included."""
+        cx, cy = int(x // cell), int(y // cell)
+        for gx in (cx - 1, cx, cx + 1):
+            for gy in (cy - 1, cy, cy + 1):
+                for k in seg_grid.get((gx, gy), ()):
+                    a, b = segs[k]
+                    t, d = _seg_param((x, y), a, b)
+                    hw = (a[3] + (b[3] - a[3]) * t) * 0.5 * width_scale
+                    if d <= hw + half_width + touch_tolerance:
+                        return True
+                for index, px, py, hw in general_pts.get((gx, gy), ()):
+                    if index != skip_index and (px - x) ** 2 + (py - y) ** 2 <= (hw + half_width + touch_tolerance) ** 2:
+                        return True
+        return False
+
+    def connector_path(end, node_id, half_width, limit, heading):
+        """(nodes, unhooked) of the best sidewalk/shoulder connector that leaves `node_id` at `end`, or (None, False).
+
+        Normally the whole connector, when it reaches a traffic road going the same way as the road. A connector
+        that sets off the right way but hooks back against the road's direction (a shortcut that runs both ways)
+        is not followed round the hook: only the part before the hook is returned, with unhooked True, and the
+        caller leaves it there for the traffic road's autoJunction to take over.
+        """
+        best = None
+        hooked = None
+        for g in by_node.get(node_id, ()):
+            nodes = [list(map(float, q)) for q in g["nodes"]]
+            if g.get("node_start") == node_id:
+                path = nodes
+            elif g.get("node_end") == node_id:
+                path = nodes[::-1]
+            else:
+                continue
+            gap = math.hypot(path[0][0] - end[0], path[0][1] - end[1])
+            if gap > half_width + path[0][3] * 0.5 * width_scale + 4.0:
+                continue                                           # the connector does not start at this road end
+            leaving = _unit(path[min(2, len(path) - 1)][0] - path[0][0], path[min(2, len(path) - 1)][1] - path[0][1])
+            arriving = _unit(path[-1][0] - path[max(len(path) - 3, 0)][0], path[-1][1] - path[max(len(path) - 3, 0)][1])
+            if leaving[0] * heading[0] + leaving[1] * heading[1] <= 0:
+                continue                                           # it sets off against the road's direction
+            if arriving[0] * heading[0] + arriving[1] * heading[1] <= 0:
+                part = _unhook(path)                               # it hooks back: keep only the part before the hook
+                if part and (hooked is None or len(part) > len(hooked)):
+                    hooked = part
+                continue
+            far = path[-1]
+            near = nearest_traffic(far[0], far[1])
+            if near is None:
+                continue
+            na, nb = segs[near[1]]
+            edge_gap = near[0] - (na[3] + (nb[3] - na[3]) * near[2]) * 0.5 * width_scale
+            if edge_gap > 3.0:
+                continue                                           # it leads to another General road, not to a traffic road
+            length = sum(math.hypot(q1[0] - q0[0], q1[1] - q0[1]) for q0, q1 in zip(path[:-1], path[1:]))
+            if length > limit:
+                continue
+            score = (round(max(edge_gap, 0.0), 1), length)
+            if best is None or score < best[0]:
+                best = (score, path)
+        if best:
+            return best[1], False
+        return (hooked, True) if hooked else (None, False)
+
+    def ray_hit(end, d, limit):
+        """(distance along the heading, segment index, parameter) of the nearest traffic road ahead, within limit."""
+        far = [end[0] + d[0] * limit, end[1] + d[1] * limit]
+        best = None
+        x0, x1 = sorted((end[0], far[0]))
+        y0, y1 = sorted((end[1], far[1]))
+        seen = set()
+        for gx in range(int(x0 // cell), int(x1 // cell) + 1):
+            for gy in range(int(y0 // cell), int(y1 // cell) + 1):
+                for k in seg_grid.get((gx, gy), ()):
+                    if k in seen:
+                        continue
+                    seen.add(k)
+                    a, b = segs[k]
+                    rx, ry, sx, sy = far[0] - end[0], far[1] - end[1], b[0] - a[0], b[1] - a[1]
+                    den = rx * sy - ry * sx
+                    if abs(den) < 1e-9:
+                        continue
+                    t = ((a[0] - end[0]) * sy - (a[1] - end[1]) * sx) / den
+                    u = ((a[0] - end[0]) * ry - (a[1] - end[1]) * rx) / den
+                    if 0.0 < t <= 1.0 and 0.0 <= u <= 1.0 and (best is None or t * limit < best[0]):
+                        best = (t * limit, k, u)
+        return best
+
+    out = list(roads)
+    report = {"general_roads": len(general), "free_ends": 0, "extended": 0, "extended_along_heading": 0,
+              "extended_to_nearest_point": 0, "followed_connector_path": 0, "connector_unhooked": 0, "connector_too_sharp": 0, "already_touching": 0, "no_traffic_road_in_reach": 0,
+              "extension_km": 0.0, "longest_extension_m": 0.0}
+    for index in general:
+        road = roads[index]
+        nodes = [list(map(float, p)) for p in road["nodes"]]
+        for at_end in (False, True):
+            end = nodes[-1] if at_end else nodes[0]
+            toward = nodes if at_end else nodes[::-1]
+            half_width = end[3] * 0.5 * width_scale
+            if touching_road(end[0], end[1], half_width, index):
+                report["already_touching"] += 1
+                continue
+            report["free_ends"] += 1
+            back = next((p for p in reversed(toward[:-1]) if math.hypot(p[0] - end[0], p[1] - end[1]) >= 3.0), toward[0])
+            dx, dy = end[0] - back[0], end[1] - back[1]
+            length = math.hypot(dx, dy) or 1.0
+            heading = (dx / length, dy / length)
+            near = nearest_traffic(end[0], end[1])
+            if near is None:
+                report["no_traffic_road_in_reach"] += 1
+                continue
+            hit = ray_hit(end, heading, min(reach, max(near[0] * 1.6, near[0] + 15.0)))
+            dist, k, t = hit if hit else near
+            a, b = segs[k]
+            if hit:
+                point = [end[0] + heading[0] * dist, end[1] + heading[1] * dist]
+            else:
+                point = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]
+            # the extension tapers from the road's end width to the traffic road's width (never wider than the road)
+            join_width = min(end[3], a[3] + (b[3] - a[3]) * t)
+            target = [round(point[0], 4), round(point[1], 4), round(a[2] + (b[2] - a[2]) * t, 4), round(join_width, 4)]
+            distance = math.hypot(target[0] - end[0], target[1] - end[1])
+            if distance < 0.5:
+                report["already_touching"] += 1
+                continue
+            followed, unhooked = None, False
+            node_id = road.get("node_end") if at_end else road.get("node_start")
+            if by_node and node_id is not None:
+                followed, unhooked = connector_path(end, node_id, half_width, guide_factor * distance + guide_extra, heading)
+            guided = None
+            if followed:
+                # the extension takes the source's own sidewalk/shoulder connector curve, joined to the road end and to
+                # the traffic road's middle by smooth curves, then runs `overlap` past that middle
+                last = followed[-1]
+                arrive = None
+                finish = None
+                if unhooked:
+                    # the connector hooks back: leave it where the hook starts and go on into the road the way it was heading
+                    ahead = _unit(last[0] - followed[-3][0], last[1] - followed[-3][1])
+                    hit_ahead = ray_hit(last, ahead, min(reach, guide_factor * distance + guide_extra))
+                    if hit_ahead:
+                        k_hit = hit_ahead[1]
+                        ha, hb = segs[k_hit]
+                        finish = _lerp_node(ha, hb, hit_ahead[2])
+                    else:
+                        near_ahead = nearest_traffic(last[0], last[1])
+                        if near_ahead is not None and near_ahead[0] <= guide_factor * distance + guide_extra:
+                            ha, hb = segs[near_ahead[1]]
+                            candidate = _lerp_node(ha, hb, near_ahead[2])
+                            toward = _unit(candidate[0] - last[0], candidate[1] - last[1])
+                            if toward[0] * ahead[0] + toward[1] * ahead[1] > 0.2:
+                                finish = candidate
+                    if finish is not None:
+                        arrive = _unit(finish[0] - last[0], finish[1] - last[1])
+                        finish[3] = min(end[3], finish[3])
+                else:
+                    nearest = nearest_traffic(last[0], last[1])
+                    finish = last
+                    if nearest is not None:
+                        na, nb = segs[nearest[1]]
+                        finish = _lerp_node(na, nb, nearest[2])
+                if finish is not None:
+                    guided = _guided_path(followed, end, heading, finish, arrive=arrive)
+                    tail = _overlap_node(guided[-2], guided[-1], overlap) if len(guided) > 1 else None
+                    if tail:
+                        guided.append(tail)
+                if guided is not None and _max_turn(guided) > guide_max_turn:
+                    guided = None                                      # would wrinkle the road: keep the straight extension
+                    report["connector_too_sharp"] += 1
+                elif unhooked and guided is not None:
+                    report["connector_unhooked"] += 1
+            if guided:
+                path = guided
+                cleaned = [path[0]]
+                for q in path[1:]:
+                    if math.hypot(q[0] - cleaned[-1][0], q[1] - cleaned[-1][1]) >= 0.5:
+                        cleaned.append(q)
+                lengths = [0.0]
+                for q0, q1 in zip(cleaned[:-1], cleaned[1:]):
+                    lengths.append(lengths[-1] + math.hypot(q1[0] - q0[0], q1[1] - q0[1]))
+                total = lengths[-1] or 1.0
+                run = [[q[0], q[1], q[2], round(end[3] + (join_width - end[3]) * (lengths[k] / total), 4)]
+                       for k, q in enumerate(cleaned) if k > 0]
+                distance = total
+            else:
+                steps = max(1, int(math.ceil(distance / 20.0)))
+                run = [_lerp_node(end, target, i / steps) for i in range(1, steps + 1)]
+                beyond = _overlap_node(end, target, overlap)
+                if beyond:
+                    run.append(beyond)
+            piece = dict(road)
+            piece_nodes = [[round(v, 4) for v in end]] + run
+            if not at_end:
+                piece_nodes = piece_nodes[::-1]
+            piece.update({
+                "id": f"{road.get('id', 'general')}_ext{int(at_end)}",
+                "source_key": f"extend:{road.get('id', 'general')}:{int(at_end)}",
+                "nodes": piece_nodes,
+                "width_start": piece_nodes[0][3], "width_end": piece_nodes[-1][3],
+                "general_extension": True, "export": True,
+            })
+            out.append(piece)
+            report["extended"] += 1
+            report["followed_connector_path" if guided else
+                   "extended_along_heading" if hit else "extended_to_nearest_point"] += 1
+            report["extension_km"] += distance / 1000.0
+            report["longest_extension_m"] = max(report["longest_extension_m"], distance)
+    report["extension_km"] = round(report["extension_km"], 2)
+    report["longest_extension_m"] = round(report["longest_extension_m"], 1)
+    return out, report
+
+
 def preserve_winding(roads):
     """Give every one-lane road whose traffic runs against the source winding BeamNG's native form.
 
@@ -1070,6 +1482,16 @@ def _lerp_node(a, b, t):
     return [round(a[k] + (b[k] - a[k]) * t, 4) for k in range(4)]
 
 
+def _overlap_node(src, point, overlap):
+    """Node `overlap` metres past `point`, on the line src -> point (None when the line has no direction)."""
+    dx, dy = point[0] - src[0], point[1] - src[1]
+    length = math.hypot(dx, dy)
+    if length < 1e-6 or overlap <= 0:
+        return None
+    return [round(point[0] + dx / length * overlap, 4), round(point[1] + dy / length * overlap, 4),
+            round(point[2], 4), round(point[3], 4)]
+
+
 INTERCHANGE_RUNOFF_REACH = 140.0   # metres a runoff end may reach in a junction that keeps its connectors
 RUNOFF_TYPE = 3   # sidewalk / shoulder lanes: their own roads, extended at junctions
 
@@ -1082,7 +1504,7 @@ def _arm_flow(c, into):
     return into if right else (not into)
 
 
-def resolve_junctions(corridors, *, min_opposite_dot=-0.3, connect_radius=50.0):
+def resolve_junctions(corridors, *, min_opposite_dot=-0.3, connect_radius=50.0, overlap=0.0):
     """Replace junction connectors by roads that end on / cross the through road.
 
     This is how hand-made BeamNG AI maps do it: no turning connectors, the roads of a
@@ -1100,7 +1522,9 @@ def resolve_junctions(corridors, *, min_opposite_dot=-0.3, connect_radius=50.0):
       placed on the nearest through road (T); an entering one-way stem merges onto it, a
       leaving one starts from it. Without any through road the arms end together at the
       middle of their ends;
-    * the traffic and median Decision connectors of the junction are dropped.
+    * the traffic and median Decision connectors of the junction are dropped;
+    * overlap (metres, 0 = off): a stem that ends on a through road runs on `overlap` metres past that
+      road's middle, so the two overlap and BeamNG's autoJunction can join them.
 
     Runoffs (zone type 3, sidewalks and shoulders) stay their own roads. In every junction
     their sidewalk/shoulder connectors are dropped and their ends are extended so each has a
@@ -1326,16 +1750,17 @@ def resolve_junctions(corridors, *, min_opposite_dot=-0.3, connect_radius=50.0):
                 c0 = a_info["c"]
                 lanes, one_way = flow_lanes(a_info)
                 entering = a_info["flow_in"] if a_info["one_way"] else a_info["into"]
+                beyond = _overlap_node(a_info["end"], point, overlap) if through else None
                 if entering:
                     start = ((a_info["node"], a_info["raw_end"])
                              if a_info["into"] and a_info["chain"] else (free_node(), -1))
-                    new_roads.append(junction_road(c0, [a_info["end"], point], start, (free_node(), -1),
-                                                   f"stem{s}", lanes, one_way))
+                    new_roads.append(junction_road(c0, [a_info["end"], point] + ([beyond] if beyond else []),
+                                                   start, (free_node(), -1), f"stem{s}", lanes, one_way))
                 else:
                     end = ((a_info["node"], a_info["raw_start"])
                            if not a_info["into"] and a_info["chain"] else (free_node(), -1))
-                    new_roads.append(junction_road(c0, [point, a_info["end"]], (free_node(), -1), end,
-                                                   f"stem{s}", lanes, one_way))
+                    new_roads.append(junction_road(c0, ([beyond] if beyond else []) + [point, a_info["end"]],
+                                                   (free_node(), -1), end, f"stem{s}", lanes, one_way))
             added.extend(new_roads)
             main_roads.extend(r["nodes"] for r in new_roads)
             for c in decisions:

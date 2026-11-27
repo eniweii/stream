@@ -29,7 +29,7 @@ from traffic_corridors import (  # noqa: E402
     DEFAULT_TYPE_RULES, build_corridors, merged_type_rules, override_key, sample_segment,
     beamng_transform, harmonize_zone_endpoints, merge_connected_corridors, combine_carriageways,
     thin_roads, resolve_junctions, scale_road_widths, keep_shoulders_near_shortcuts,
-    preserve_winding,
+    preserve_winding, drop_shoulders, extend_general_roads, shoulder_guides,
 )
 from traffic_node_exporter import write_items_level, write_source_manifest  # noqa: E402
 try:  # Use the repository's shared output-path convention.
@@ -94,6 +94,12 @@ class TrafficNodeEditor(tk.Tk):
         self.shoulders_near_var = tk.BooleanVar(value=False)  # keep shoulders/sidewalks only near a shortcut (General road)
         self.shortcut_reach_var = tk.StringVar(value="12")    # metres a kept shoulder is extended past its contact with a shortcut
         self.shoulder_report = {}
+        self.ignore_shoulders_var = tk.BooleanVar(value=True)  # sidewalks and shoulders (types 2, 3) are left out of the export
+        self.extend_general_var = tk.BooleanVar(value=True)    # free ends of General roads run on to the nearest traffic road
+        self.junction_overlap_var = tk.StringVar(value="2")    # metres a stem / extension runs past the middle of the road it meets
+        self.follow_guides_var = tk.BooleanVar(value=False)    # extensions follow the sidewalk/shoulder Decision connector at their end node
+        self.extension_report = {}
+        self.dropped_shoulders = 0
         self.junction_report = {}
         self.road_detail_var = tk.StringVar(value="1")   # DecalRoad "detail" (BeamNG default 0.1)
 
@@ -391,6 +397,20 @@ class TrafficNodeEditor(tk.Tk):
                             row=15, column=0, columnspan=2, sticky="w", pady=3)
         ttk.Label(input_box, text="Shoulder extension past the connection (m):").grid(row=16, column=0, sticky="w", padx=(0, 8), pady=3)
         ttk.Entry(input_box, textvariable=self.shortcut_reach_var, width=24).grid(row=16, column=1, sticky="w", pady=3)
+        ttk.Checkbutton(input_box, text="Ignore sidewalks and shoulders (left out of the export entirely)",
+                        variable=self.ignore_shoulders_var,
+                        command=self._on_extension_change).grid(
+                            row=17, column=0, columnspan=2, sticky="w", pady=3)
+        ttk.Checkbutton(input_box, text="Extend General roads to the nearest traffic road",
+                        variable=self.extend_general_var,
+                        command=self._on_extension_change).grid(
+                            row=18, column=0, columnspan=2, sticky="w", pady=3)
+        ttk.Checkbutton(input_box, text="General road extensions follow the sidewalk / shoulder connector curve of their end where there is one (smooth source path)",
+                        variable=self.follow_guides_var,
+                        command=self._on_extension_change).grid(
+                            row=20, column=0, columnspan=2, sticky="w", pady=3)
+        ttk.Label(input_box, text="Overlap past the road they meet, junction stems and General roads (m, 0 = none):").grid(row=19, column=0, sticky="w", padx=(0, 8), pady=3)
+        ttk.Entry(input_box, textvariable=self.junction_overlap_var, width=24).grid(row=19, column=1, sticky="w", pady=3)
         action_row = ttk.Frame(outer)
         action_row.pack(fill=tk.X, pady=8)
         ttk.Button(action_row, text="Rebuild preview", command=self.rebuild_preview).pack(side=tk.LEFT, padx=(0, 5))
@@ -410,7 +430,7 @@ class TrafficNodeEditor(tk.Tk):
         if DEFAULT_OVERRIDES.exists():
             try:
                 data = json.loads(DEFAULT_OVERRIDES.read_text(encoding="utf-8"))
-                self.state_data.update({k: data[k] for k in ("vertical_offset", "type_rules", "overrides", "patterns", "include_decision_connectors", "over_objects", "combine_carriageways", "node_tolerance", "max_node_spacing", "merge_connectors", "road_detail", "junction_roads", "node_width_scale", "connect_radius", "shoulders_near_shortcuts", "shortcut_reach") if k in data})
+                self.state_data.update({k: data[k] for k in ("vertical_offset", "type_rules", "overrides", "patterns", "include_decision_connectors", "over_objects", "combine_carriageways", "node_tolerance", "max_node_spacing", "merge_connectors", "road_detail", "junction_roads", "node_width_scale", "connect_radius", "shoulders_near_shortcuts", "shortcut_reach", "ignore_shoulders", "extend_general", "junction_overlap", "follow_guides") if k in data})
                 self.type_rules = merged_type_rules(self.state_data.get("type_rules"))
                 self.vertical_offset_var.set(str(self.state_data.get("vertical_offset", 150.0)))
                 self.include_decision_connectors_var.set(bool(self.state_data.get("include_decision_connectors", True)))
@@ -425,6 +445,10 @@ class TrafficNodeEditor(tk.Tk):
                 self.connect_radius_var.set(str(self.state_data.get("connect_radius", 0.0)))
                 self.shoulders_near_var.set(bool(self.state_data.get("shoulders_near_shortcuts", False)))
                 self.shortcut_reach_var.set(str(self.state_data.get("shortcut_reach", 12.0)))
+                self.ignore_shoulders_var.set(bool(self.state_data.get("ignore_shoulders", True)))
+                self.extend_general_var.set(bool(self.state_data.get("extend_general", True)))
+                self.junction_overlap_var.set(str(self.state_data.get("junction_overlap", 2.0)))
+                self.follow_guides_var.set(bool(self.state_data.get("follow_guides", False)))
                 self.override_path = DEFAULT_OVERRIDES
             except (OSError, ValueError, TypeError) as exc:
                 print(f"[traffic_node_editor] Could not load default overrides: {exc}")
@@ -483,17 +507,27 @@ class TrafficNodeEditor(tk.Tk):
         self.corridors = self.preview["corridors"]
         self.zone_endpoint_report = endpoint_report
         export_input = self.corridors
+        self.dropped_shoulders = 0
+        if self.ignore_shoulders_var.get():
+            export_input, self.dropped_shoulders = drop_shoulders(export_input)
         self.carriageway_report = {}
         if self.combine_carriageways_var.get():
             export_input, self.carriageway_report = combine_carriageways(self.corridors, combine_connectors=True)
         self.junction_report = {}
         if self.combine_carriageways_var.get() and self.junction_roads_var.get():
-            export_input, self.junction_report = resolve_junctions(export_input, connect_radius=self._connect_radius())
+            export_input, self.junction_report = resolve_junctions(export_input, connect_radius=self._connect_radius(),
+                                                                  overlap=self._junction_overlap())
         self.export_roads = merge_connected_corridors(export_input, merge_decision=self.merge_connectors_var.get())
         self.shoulder_report = {}
         if self.shoulders_near_var.get():
             self.export_roads, self.shoulder_report = keep_shoulders_near_shortcuts(
                 self.export_roads, self._shortcut_reach(), width_scale=self._width_scale())
+        self.extension_report = {}
+        if self.extend_general_var.get():
+            guides = shoulder_guides(self.corridors) if self.follow_guides_var.get() else None
+            self.export_roads, self.extension_report = extend_general_roads(
+                self.export_roads, self._junction_overlap(), max_reach=self._connect_radius(), width_scale=self._width_scale(),
+                guides=guides)
         tolerance, spacing = self._thin_settings()
         self.export_roads, self.thin_report = thin_roads(self.export_roads, tolerance, spacing,
                                                          max(tolerance, 0.5) if tolerance > 0 else None)
@@ -503,7 +537,7 @@ class TrafficNodeEditor(tk.Tk):
         self.winding_report = {"roads_back_in_source_winding": flipped}
         self.export_roads = scale_road_widths(self.export_roads, self._width_scale())
         self._built_settings = (tolerance, spacing, self.merge_connectors_var.get(), self._width_scale(), self._connect_radius(),
-                                self.shoulders_near_var.get(), self._shortcut_reach())
+                                self.shoulders_near_var.get(), self._shortcut_reach(), *self._extension_settings())
         self.merge_warnings = []  # ambiguous source-graph joins intentionally stay split
         self.corridor_by_key = {c["source_key"]: c for c in self.corridors}
         if hasattr(self, "filter_combo"):
@@ -1052,6 +1086,10 @@ class TrafficNodeEditor(tk.Tk):
         self.state_data["connect_radius"] = self._connect_radius()
         self.state_data["shoulders_near_shortcuts"] = self.shoulders_near_var.get()
         self.state_data["shortcut_reach"] = self._shortcut_reach()
+        self.state_data["ignore_shoulders"] = self.ignore_shoulders_var.get()
+        self.state_data["extend_general"] = self.extend_general_var.get()
+        self.state_data["junction_overlap"] = self._junction_overlap()
+        self.state_data["follow_guides"] = self.follow_guides_var.get()
         tolerance, spacing = self._thin_settings()
         self.state_data["node_tolerance"], self.state_data["max_node_spacing"] = tolerance, spacing
         try:
@@ -1068,7 +1106,7 @@ class TrafficNodeEditor(tk.Tk):
         if path:
             try:
                 data = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
-                self.state_data.update({k: data[k] for k in ("vertical_offset", "type_rules", "overrides", "patterns", "include_decision_connectors", "over_objects", "combine_carriageways", "node_tolerance", "max_node_spacing", "merge_connectors", "road_detail", "junction_roads", "node_width_scale", "connect_radius", "shoulders_near_shortcuts", "shortcut_reach") if k in data})
+                self.state_data.update({k: data[k] for k in ("vertical_offset", "type_rules", "overrides", "patterns", "include_decision_connectors", "over_objects", "combine_carriageways", "node_tolerance", "max_node_spacing", "merge_connectors", "road_detail", "junction_roads", "node_width_scale", "connect_radius", "shoulders_near_shortcuts", "shortcut_reach", "ignore_shoulders", "extend_general", "junction_overlap", "follow_guides") if k in data})
                 self.type_rules = merged_type_rules(self.state_data.get("type_rules"))
                 self.vertical_offset_var.set(str(self.state_data.get("vertical_offset", 150.0)))
                 self.include_decision_connectors_var.set(bool(self.state_data.get("include_decision_connectors", True)))
@@ -1083,6 +1121,10 @@ class TrafficNodeEditor(tk.Tk):
                 self.connect_radius_var.set(str(self.state_data.get("connect_radius", 0.0)))
                 self.shoulders_near_var.set(bool(self.state_data.get("shoulders_near_shortcuts", False)))
                 self.shortcut_reach_var.set(str(self.state_data.get("shortcut_reach", 12.0)))
+                self.ignore_shoulders_var.set(bool(self.state_data.get("ignore_shoulders", True)))
+                self.extend_general_var.set(bool(self.state_data.get("extend_general", True)))
+                self.junction_overlap_var.set(str(self.state_data.get("junction_overlap", 2.0)))
+                self.follow_guides_var.set(bool(self.state_data.get("follow_guides", False)))
                 self.override_path = pathlib.Path(path)
                 self._dirty = False
                 self.rebuild_preview()
@@ -1141,6 +1183,26 @@ class TrafficNodeEditor(tk.Tk):
             return value if math.isfinite(value) and value > 0 else 12.0
         except ValueError:
             return 12.0
+
+    def _junction_overlap(self):
+        """Metres a junction stem or General road extension runs past the middle of the road it meets."""
+        try:
+            value = float(self.junction_overlap_var.get())
+            return value if math.isfinite(value) and value >= 0 else 2.0
+        except ValueError:
+            return 2.0
+
+    def _extension_settings(self):
+        return (self.ignore_shoulders_var.get(), self.extend_general_var.get(), self._junction_overlap(),
+                self.follow_guides_var.get())
+
+    def _on_extension_change(self):
+        self.state_data["ignore_shoulders"] = self.ignore_shoulders_var.get()
+        self.state_data["extend_general"] = self.extend_general_var.get()
+        self.state_data["junction_overlap"] = self._junction_overlap()
+        self.state_data["follow_guides"] = self.follow_guides_var.get()
+        self._dirty = True
+        self.rebuild_preview()
 
     def _on_shoulder_filter_change(self):
         self.state_data["shoulders_near_shortcuts"] = self.shoulders_near_var.get()
@@ -1214,6 +1276,10 @@ class TrafficNodeEditor(tk.Tk):
         lines.append(f"Merge junction connectors: {self.merge_connectors_var.get()}")
         for k, v in getattr(self, "winding_report", {}).items():
             lines.append(f"{k}: {v}")
+        lines.append(f"Sidewalks and shoulders ignored: {self.ignore_shoulders_var.get()} ({getattr(self, 'dropped_shoulders', 0):,} zone paths left out)")
+        lines.append(f"General roads extended to the nearest traffic road: {self.extend_general_var.get()} (overlap {self._junction_overlap()} m, follow sidewalk/shoulder paths: {self.follow_guides_var.get()})")
+        for k, v in getattr(self, "extension_report", {}).items():
+            lines.append(f"  {k}: {v}")
         lines.append(f"Shoulders only near a shortcut: {self.shoulders_near_var.get()} (reach {self._shortcut_reach()} m)")
         for k, v in getattr(self, "shoulder_report", {}).items():
             lines.append(f"  {k}: {v}")
@@ -1259,7 +1325,7 @@ class TrafficNodeEditor(tk.Tk):
             vertical_offset = float(self.vertical_offset_var.get())
             if vertical_offset != self.preview["vertical_offset"] or self._built_settings != (
                     *self._thin_settings(), self.merge_connectors_var.get(), self._width_scale(), self._connect_radius(),
-                    self.shoulders_near_var.get(), self._shortcut_reach()):
+                    self.shoulders_near_var.get(), self._shortcut_reach(), *self._extension_settings()):
                 self.rebuild_preview()
         except ValueError as exc:
             messagebox.showerror("Export settings", str(exc)); return
@@ -1293,6 +1359,12 @@ class TrafficNodeEditor(tk.Tk):
                       "shoulders_near_shortcuts": self.shoulders_near_var.get(),
                       "shortcut_reach": self._shortcut_reach(),
                       "shoulders": self.shoulder_report,
+                      "ignore_shoulders": self.ignore_shoulders_var.get(),
+                      "dropped_shoulder_zone_paths": self.dropped_shoulders,
+                      "extend_general_roads": self.extend_general_var.get(),
+                      "junction_overlap": self._junction_overlap(),
+                      "follow_guides": self.follow_guides_var.get(),
+                      "general_extensions": self.extension_report,
                       "junction_roads": self.junction_roads_var.get() and self.combine_carriageways_var.get(),
                       "junctions": self.junction_report,
                       "node_thinning": {"tolerance": self._thin_settings()[0], "max_spacing": self._thin_settings()[1],

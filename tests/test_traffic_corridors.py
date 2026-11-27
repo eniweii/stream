@@ -10,6 +10,7 @@ from traffic_corridors import (
     build_corridors, merged_type_rules, get_oriented_zone,
                                 merge_connected_corridors, harmonize_zone_endpoints, combine_carriageways,
                                 thin_nodes, thin_roads, resolve_junctions, scale_road_widths, keep_shoulders_near_shortcuts, preserve_winding,
+                                drop_shoulders, extend_general_roads, shoulder_guides, _max_turn,
                                 _corridor_merge_signature,
                                 FLAG_START_INVERTED, FLAG_DECISION, FLAG_NO_TRAFFIC)
 from traffic_node_exporter import write_items_level, write_source_manifest
@@ -267,6 +268,13 @@ class JunctionRoadTests(unittest.TestCase):
         self.assertEqual([n[:2] for n in through["nodes"]], [[-10.0, 0.0], [0.0, 0.0], [10.0, 0.0]])
         self.assertEqual([n[:2] for n in stem["nodes"]], [[0.0, -15.0], [0.0, 0.0]])
         self.assertEqual((through["lanes_left"], through["lanes_right"], through["one_way"]), (1, 1, False))
+
+    def test_stem_runs_past_the_through_road_by_the_overlap(self):
+        out, _ = resolve_junctions(self._t_junction(), overlap=2.0)
+        stem = [c for c in out if c.get("combined_junction") and "stem" in c["id"]][0]
+        self.assertEqual([n[:2] for n in stem["nodes"]], [[0.0, -15.0], [0.0, 0.0], [0.0, 2.0]])
+        through = [c for c in out if c.get("combined_junction") and "through" in c["id"]][0]
+        self.assertEqual([n[:2] for n in through["nodes"]], [[-10.0, 0.0], [0.0, 0.0], [10.0, 0.0]])   # through road unchanged
 
     def test_arms_and_junction_roads_chain_into_long_roads(self):
         out, _ = resolve_junctions(self._t_junction())
@@ -690,6 +698,140 @@ class TrafficCorridorTests(unittest.TestCase):
             self.assertEqual(len(manifest_data["corridors"]), 3)
             self.assertEqual(manifest_data["vertical_offset"], 150.0)
             self.assertTrue(manifest_data["vertical_offset_applied_during_serialization"])
+
+
+class GeneralRoadExtensionTests(unittest.TestCase):
+    def test_free_end_runs_along_its_heading_to_the_traffic_road_and_past_its_middle(self):
+        roads = [_road("main", 1, [(-200, 50), (200, 50)], width=8.0),
+                 _road("cut", 10, [(0, -100), (0, 0)], width=4.0)]
+        out, report = extend_general_roads(roads, overlap=2.0)
+        ext = [r for r in out if r.get("general_extension") and r["id"] == "cut_ext1"]
+        self.assertEqual(len(ext), 1)                                              # the far end (y = -100) is free too
+        self.assertEqual([n[:2] for n in (ext[0]["nodes"][0], ext[0]["nodes"][-1])], [[0.0, 0.0], [0.0, 52.0]])
+        self.assertIn([0.0, 50.0], [n[:2] for n in ext[0]["nodes"]])             # a node on the traffic road's middle
+        self.assertEqual((report["free_ends"], report["extended"], report["extended_along_heading"]), (2, 2, 1))
+        self.assertEqual(out[:2], roads)                                           # source roads are untouched
+
+    def test_heading_that_misses_goes_to_the_nearest_point(self):
+        roads = [_road("main", 1, [(-200, 50), (200, 50)], width=8.0),
+                 _road("cut", 10, [(60, 0), (100, 10)], width=4.0)]                # heads away from the road, 40 m off it
+        out, report = extend_general_roads(roads, overlap=1.0)
+        ends = [r for r in out if r.get("general_extension")]
+        self.assertGreaterEqual(report["extended_to_nearest_point"], 1)
+        self.assertTrue(all(abs(r["nodes"][-1][1] - 51.0) < 1e-6 or abs(r["nodes"][0][1] - 51.0) < 1e-6 for r in ends))
+
+    def test_ends_that_already_touch_a_road_are_left_alone(self):
+        roads = [_road("main", 1, [(-200, 0), (200, 0)], width=8.0),
+                 _road("cut", 10, [(0, 3), (0, 100)], width=4.0)]                  # start overlaps the traffic road's width
+        out, report = extend_general_roads(roads)
+        self.assertEqual(report["already_touching"], 1)
+        self.assertFalse([r for r in out if r["id"] == "cut_ext0"])
+
+    def test_extension_at_the_start_keeps_the_roads_winding_and_lanes(self):
+        cut = _road("cut", 10, [(0, 0), (0, 100)], width=4.0)
+        cut.update({"lanes_left": 0, "lanes_right": 2, "one_way": True})
+        roads = [_road("main", 1, [(-200, -50), (200, -50)], width=8.0), cut]
+        out, _ = extend_general_roads(roads, overlap=2.0)
+        ext = [r for r in out if r["id"] == "cut_ext0"][0]
+        self.assertEqual([n[:2] for n in (ext["nodes"][0], ext["nodes"][-1])], [[0.0, -52.0], [0.0, 0.0]])   # runs along the road's winding
+        self.assertEqual((ext["lanes_left"], ext["lanes_right"], ext["one_way"]), (0, 2, True))
+
+    def test_extension_width_tapers_to_the_traffic_road_and_never_grows(self):
+        roads = [_road("main", 1, [(-200, 50), (200, 50)], width=8.0), _road("cut", 10, [(0, -100), (0, 0)], width=30.0)]
+        ext = [r for r in extend_general_roads(roads)[0] if r["id"] == "cut_ext1"][0]
+        self.assertEqual((ext["nodes"][0][3], ext["nodes"][-1][3]), (30.0, 8.0))
+        roads = [_road("main", 1, [(-200, 50), (200, 50)], width=8.0), _road("cut", 10, [(0, -100), (0, 0)], width=3.0)]
+        ext = [r for r in extend_general_roads(roads)[0] if r["id"] == "cut_ext1"][0]
+        self.assertEqual(max(n[3] for n in ext["nodes"]), 3.0)
+
+    def test_nothing_in_reach_means_no_extension(self):
+        roads = [_road("main", 1, [(0, 900), (100, 900)], width=8.0), _road("cut", 10, [(0, 0), (0, 50)], width=4.0)]
+        out, report = extend_general_roads(roads, max_reach=100.0)
+        self.assertEqual((len(out), report["no_traffic_road_in_reach"]), (2, 2))
+
+    def _connector(self, node_start, node_end, points, source_type=3, width=2.0):
+        c = _road("link", source_type, points, width=width)
+        c.update({"node_start": node_start, "node_end": node_end, "source_decision": True})
+        return c
+
+    def test_extension_follows_the_shoulder_connector_of_its_end_node_without_corners(self):
+        main = _road("main", 1, [(-200, 0), (200, 0)], width=8.0)
+        cut = _road("cut", 10, [(60, 40), (60, 60)], width=3.0)                    # free start end at (60, 40), pointing down
+        cut.update({"node_start": 7, "node_end": 8})
+        link = self._connector(3, 7, [(46, 4), (52, 12), (58, 25), (63, 37)])      # gentle curve from the main road to node 7,
+        plain, _ = extend_general_roads([main, cut])                               # starting 3 m beside the road end
+        followed, report = extend_general_roads([main, cut], guides=[link])
+        straight = [r for r in plain if r["id"] == "cut_ext0"][0]
+        guided = [r for r in followed if r["id"] == "cut_ext0"][0]
+        self.assertEqual(report["followed_connector_path"], 1)
+        self.assertNotEqual(guided["nodes"], straight["nodes"])
+        self.assertEqual(guided["nodes"][-1][:2], [60.0, 40.0])                    # an extension at the road's start runs towards it
+        self.assertLessEqual(_max_turn(guided["nodes"]), 30.0)                     # no sharp angles anywhere
+        self.assertAlmostEqual(guided["nodes"][1][1], 0.0, delta=0.5)              # ends on the main road's middle ...
+        self.assertLess(guided["nodes"][0][1], -1.0)                               # ... and runs on past it (the overlap)
+
+    def test_connector_that_turns_back_against_the_roads_direction_is_not_used(self):
+        main = _road("main", 1, [(-200, 0), (200, 0)], width=8.0)
+        cut = _road("cut", 10, [(60, 40), (60, 60)], width=3.0)                    # extension heads down (0, -1)
+        cut.update({"node_start": 7, "node_end": 8})
+        sets_off_backwards = self._connector(3, 7, [(60, 2), (90, 20), (70, 60), (60, 40)])      # leaves the end upwards
+        arrives_backwards = self._connector(3, 7, [(55, -6), (60, -12), (70, -10), (62, 20), (60, 40)])   # reaches the road heading up
+        for link in (sets_off_backwards, arrives_backwards):
+            out, report = extend_general_roads([main, cut], guides=[link])
+            self.assertEqual(report["followed_connector_path"], 0)
+        good = self._connector(3, 7, [(46, 4), (52, 12), (58, 25), (63, 37)])
+        out, report = extend_general_roads([main, cut], guides=[sets_off_backwards, good])
+        self.assertEqual(report["followed_connector_path"], 1)                    # the connector that goes the same way is picked
+
+    def test_hooked_connector_is_followed_only_up_to_the_hook_then_goes_straight_into_the_road(self):
+        main = _road("main", 1, [(-200, 0), (200, 0)], width=8.0)
+        cut = _road("cut", 10, [(60, 40), (60, 60)], width=3.0)                    # extension heads down (0, -1)
+        cut.update({"node_start": 7, "node_end": 8})
+        hook = self._connector(7, 3, [(60, 40), (63, 28), (68, 15), (64, 5), (52, 8), (46, 14)])   # sets off right, then hooks back
+        out, report = extend_general_roads([main, cut], guides=[hook])
+        ext = [r for r in out if r["id"] == "cut_ext0"][0]
+        self.assertEqual((report["followed_connector_path"], report["connector_unhooked"]), (1, 1))
+        self.assertTrue(all(n[0] > 55.0 for n in ext["nodes"]))                    # never swings round the hook (x down to 46)
+        self.assertEqual(ext["nodes"][-1][:2], [60.0, 40.0])
+        self.assertAlmostEqual(ext["nodes"][1][1], 0.0, delta=0.5)                 # ends on the main road's middle ...
+        self.assertLess(ext["nodes"][0][1], -1.0)                                  # ... and runs on past it, for autoJunction
+        self.assertLessEqual(_max_turn(ext["nodes"]), 30.0)
+
+    def test_connector_whose_path_would_wrinkle_the_road_is_not_used(self):
+        main = _road("main", 1, [(-200, 0), (200, 0)], width=8.0)
+        cut = _road("cut", 10, [(60, 40), (60, 60)], width=3.0)
+        cut.update({"node_start": 7, "node_end": 8})
+        link = self._connector(3, 7, [(40, 2), (40, 40), (60, 40)])                # right-angle corner
+        out, report = extend_general_roads([main, cut], guides=[link])
+        self.assertEqual((report["followed_connector_path"], report["connector_too_sharp"]), (0, 1))
+        self.assertEqual(report["extended_along_heading"] + report["extended_to_nearest_point"], 2)   # both ends stay straight
+
+    def test_connector_is_ignored_when_it_is_elsewhere_leads_nowhere_or_is_too_long(self):
+        main = _road("main", 1, [(-200, 0), (200, 0)], width=8.0)
+        cut = _road("cut", 10, [(60, 40), (60, 60)], width=3.0)
+        cut.update({"node_start": 7, "node_end": 8})
+        other_node = self._connector(3, 9, [(40, 2), (40, 40), (60, 40)])          # belongs to another node
+        elsewhere = self._connector(3, 7, [(300, 300), (300, 340)])                # starts far from this end
+        nowhere = self._connector(3, 7, [(60, 40), (60, 90)])                      # leads away from every traffic road
+        long = self._connector(3, 7, [(60, 40), (60, 100), (-100, 100), (-100, 2)])  # reaches the road, but a long way round
+        for link in (other_node, elsewhere, nowhere, long):
+            out, report = extend_general_roads([main, cut], guides=[link])
+            self.assertEqual(report["followed_connector_path"], 0)
+
+    def test_shoulder_guides_keep_only_sidewalk_and_shoulder_decision_connectors(self):
+        zones = [{"id": "lane", "source_type": 1, "source_decision": True, "nodes": [[0, 0, 0, 3], [10, 0, 0, 3]]},
+                 {"id": "plain", "source_type": 3, "source_decision": False, "nodes": [[0, 0, 0, 3], [10, 0, 0, 3]]},
+                 {"id": "link", "source_type": 3, "source_decision": True, "nodes": [[0, 0, 0, 3], [10, 0, 0, 3]]},
+                 {"id": "walk", "source_type": 2, "source_decision": True, "nodes": [[0, 0, 0, 3], [10, 0, 0, 3]]}]
+        self.assertEqual([g["id"] for g in shoulder_guides(zones)], ["link", "walk"])
+        self.assertEqual(len(zones), 4)
+
+class DropShouldersTests(unittest.TestCase):
+    def test_sidewalk_and_shoulder_zones_are_left_out(self):
+        zones = [{"id": str(t), "source_type": t} for t in (1, 2, 3, 4, 10)]
+        kept, dropped = drop_shoulders(zones)
+        self.assertEqual(([z["id"] for z in kept], dropped), (["1", "4", "10"], 2))
+        self.assertEqual(len(zones), 5)
 
 
 if __name__ == "__main__":
